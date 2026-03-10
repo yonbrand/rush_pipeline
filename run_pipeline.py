@@ -142,7 +142,7 @@ def process_subject(
         processed_acc, models['gait_detection'], device,
         window_len, step_len,
         batch_size=cfg.pipeline.get('inference_batch_size', 512),
-        min_variance=cfg.pipeline.get('min_gait_variance', 0.1),
+        static_variance_percentile=cfg.pipeline.get('static_variance_percentile', 10.0),
     )
 
     if len(pred_walk) == 0:

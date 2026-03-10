@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 def run_gait_detection(acc: np.ndarray, model, device,
                        window_len: int, step_len: int,
                        batch_size: int = 512,
-                       min_variance: float = 0.1) -> np.ndarray:
+                       static_variance_percentile: float = 10.0) -> np.ndarray:
     """
     Run gait detection model on windowed acceleration data.
 
@@ -31,9 +31,9 @@ def run_gait_detection(acc: np.ndarray, model, device,
         window_len: Window length in samples.
         step_len: Step between windows in samples.
         batch_size: Inference batch size.
-        min_variance: Minimum signal variance to consider as potential gait.
-                      Windows below this threshold are marked as non-gait
-                      without running inference (filters static signals).
+        static_variance_percentile: Windows with variance below this percentile
+                                    are considered static and marked as non-gait
+                                    without running inference. Set to 0 to disable.
 
     Returns:
         Binary predictions per window (1=walking, 0=not).
@@ -49,12 +49,20 @@ def run_gait_detection(acc: np.ndarray, model, device,
     # Pre-filter: calculate variance per window (mean across 3 axes)
     # Static signals have very low variance and can't be gait
     window_variance = np.var(windows, axis=1).mean(axis=1)
-    active_mask = window_variance >= min_variance
+
+    # Adaptive threshold: use percentile of this subject's variance distribution
+    if static_variance_percentile > 0:
+        variance_threshold = np.percentile(window_variance, static_variance_percentile)
+        active_mask = window_variance > variance_threshold
+    else:
+        active_mask = np.ones(n_windows, dtype=bool)
+
     active_indices = np.where(active_mask)[0]
 
     n_filtered = n_windows - len(active_indices)
     if n_filtered > 0:
-        logger.debug(f"Filtered {n_filtered}/{n_windows} low-variance windows (threshold={min_variance})")
+        logger.debug(f"Filtered {n_filtered}/{n_windows} low-variance windows "
+                     f"(percentile={static_variance_percentile}, threshold={variance_threshold:.4f})")
 
     # Initialize all predictions as non-gait
     predictions = np.zeros(n_windows, dtype=int)
