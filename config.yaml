@@ -13,7 +13,7 @@ pipeline:
   inference_batch_size: 512
   drop_first_last_days: true
   epoch_len: 10
-  static_variance_percentile: 10  # Filter windows in the bottom X percentile of variance as static. Set to 0 to disable.
+  filter_static_windows: true  # Use Otsu's method to filter low-variance (static) windows before gait detection.
   min_wear_hours: 72  # Minimum hours of valid wear data (72h = 3 days). Subjects below this are excluded.
   require_all_hours: true  # Require wear data in each one-hour period of the 24-hour cycle.
 

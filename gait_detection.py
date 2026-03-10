@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 def run_gait_detection(acc: np.ndarray, model, device,
                        window_len: int, step_len: int,
                        batch_size: int = 512,
-                       static_variance_percentile: float = 10.0) -> np.ndarray:
+                       filter_static: bool = True) -> np.ndarray:
     """
     Run gait detection model on windowed acceleration data.
 
@@ -31,9 +31,8 @@ def run_gait_detection(acc: np.ndarray, model, device,
         window_len: Window length in samples.
         step_len: Step between windows in samples.
         batch_size: Inference batch size.
-        static_variance_percentile: Windows with variance below this percentile
-                                    are considered static and marked as non-gait
-                                    without running inference. Set to 0 to disable.
+        filter_static: If True, use Otsu's method to filter low-variance
+                       (static) windows before inference.
 
     Returns:
         Binary predictions per window (1=walking, 0=not).
@@ -50,19 +49,20 @@ def run_gait_detection(acc: np.ndarray, model, device,
     # Static signals have very low variance and can't be gait
     window_variance = np.var(windows, axis=1).mean(axis=1)
 
-    # Adaptive threshold: use percentile of this subject's variance distribution
-    if static_variance_percentile > 0:
-        variance_threshold = np.percentile(window_variance, static_variance_percentile)
+    # Adaptive threshold using Otsu's method to separate static/active windows
+    if filter_static:
+        variance_threshold = _otsu_threshold(window_variance)
         active_mask = window_variance > variance_threshold
     else:
         active_mask = np.ones(n_windows, dtype=bool)
+        variance_threshold = 0.0
 
     active_indices = np.where(active_mask)[0]
 
     n_filtered = n_windows - len(active_indices)
     if n_filtered > 0:
         logger.debug(f"Filtered {n_filtered}/{n_windows} low-variance windows "
-                     f"(percentile={static_variance_percentile}, threshold={variance_threshold:.4f})")
+                     f"(Otsu threshold={variance_threshold:.6f})")
 
     # Initialize all predictions as non-gait
     predictions = np.zeros(n_windows, dtype=int)
@@ -83,6 +83,63 @@ def run_gait_detection(acc: np.ndarray, model, device,
     predictions[active_indices] = active_preds
 
     return predictions
+
+
+def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+    """
+    Compute optimal threshold using Otsu's method.
+
+    Finds the threshold that maximizes between-class variance,
+    effectively separating the data into two classes (static/active).
+
+    Args:
+        values: 1D array of values to threshold.
+        n_bins: Number of histogram bins.
+
+    Returns:
+        Optimal threshold value.
+    """
+    # Handle edge cases
+    if len(values) == 0:
+        return 0.0
+    if np.all(values == values[0]):
+        return values[0]
+
+    # Compute histogram
+    hist, bin_edges = np.histogram(values, bins=n_bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Total number of samples and mean
+    total = hist.sum()
+    sum_total = np.sum(hist * bin_centers)
+
+    # Find threshold that maximizes between-class variance
+    sum_bg = 0.0
+    weight_bg = 0
+    max_variance = 0.0
+    threshold = bin_centers[0]
+
+    for i, (count, center) in enumerate(zip(hist, bin_centers)):
+        weight_bg += count
+        if weight_bg == 0:
+            continue
+
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+
+        sum_bg += count * center
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+
+        # Between-class variance
+        variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+
+        if variance > max_variance:
+            max_variance = variance
+            threshold = center
+
+    return threshold
 
 
 def window_predictions_to_seconds(pred_walk: np.ndarray,
