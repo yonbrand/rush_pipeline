@@ -125,7 +125,17 @@ def extract_features_for_subject(
         # so we scale by 1/10 to avoid counting steps 10 times.
         overlap_factor = step_len / window_len  # 30/300 = 0.1 for 90% overlap
         per_window_steps = np.round(dl_results['step_count'])
-        bout_total_steps = np.round(float(np.sum(per_window_steps) * overlap_factor))
+        # bout_total_steps = np.round(float(np.sum(per_window_steps) * overlap_factor))
+
+        # 1. Calculate steps per second for each window
+        steps_per_sec = per_window_steps / (window_len / target_fs)
+
+        # 2. Get the representative cadence for this bout (Median is more robust to outliers)
+        bout_cadence = np.median(steps_per_sec)
+
+        # 3. Multiply by actual bout duration (in seconds)
+        bout_duration_sec = (s_end - s_start) / target_fs
+        bout_total_steps = np.round(bout_cadence * bout_duration_sec)
 
         # --- Store window-level rows ---
         for w_idx in range(n_win):
