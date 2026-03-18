@@ -57,19 +57,31 @@ def _todict(matobj):
 # Subject ID parsing (unified, single source of truth)
 # ============================================================================
 
-def parse_subject_id(file_path) -> Optional[str]:
+def parse_subject_id(file_path: str) -> Optional[str]:
     """
-    Extract subject ID from filename → 'projid_year' with no leading zeros.
-
-    Handles formats:
-        12345678_00_GENEActive.mat  → '12345678_0'
-        12345678-00-something.mat   → '12345678_0'
+    Extract subject ID from filename.
+    Handles both GENEActive (legacy) and Axivity (new) formats.
     """
     filename = Path(file_path).stem
+
+    # 1. Axivity Format Check (e.g., 2020_03_23002_10262879_03_02212020)
+    # If it starts with a 202X year followed by an underscore, it's Axivity.
+    if re.match(r'^20\d{2}_', filename):
+        # Skips the first 3 groups (Year, Month, ID), captures the 4th and 5th
+        match = re.match(r'^\d{4}_\d+_\d+_(\d+)_(\d+)', filename)
+        if match:
+            # We skip casting to int() here to preserve the leading zero in "03"
+            return f"{match.group(1)}_{match.group(2)}"
+
+    # 2. Original GENEActive Format Check (e.g., 00009121-09-01292019...)
     match = re.match(r'^(\d+)[-_](\d+)', filename)
     if match:
+        # Kept the int() cast from your original code
+        # (Note: this will strip leading zeros, e.g., turning "09" into "9")
         return f"{int(match.group(1))}_{int(match.group(2))}"
-    return None
+
+    # Fallback for any unrecognized formats
+    return filename
 
 
 def normalize_id(id_str: str) -> str:
