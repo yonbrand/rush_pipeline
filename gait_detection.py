@@ -51,7 +51,7 @@ def run_gait_detection(acc: np.ndarray, model, device,
 
     # Adaptive threshold using Otsu's method to separate static/active windows
     if filter_static:
-        variance_threshold = _otsu_threshold(window_variance)
+        variance_threshold = _otsu_threshold_log(window_variance)
         active_mask = window_variance > variance_threshold
     else:
         active_mask = np.ones(n_windows, dtype=bool)
@@ -85,61 +85,114 @@ def run_gait_detection(acc: np.ndarray, model, device,
     return predictions
 
 
-def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
-    """
-    Compute optimal threshold using Otsu's method.
+# def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+#     """
+#     Compute optimal threshold using Otsu's method.
+#
+#     Finds the threshold that maximizes between-class variance,
+#     effectively separating the data into two classes (static/active).
+#
+#     Args:
+#         values: 1D array of values to threshold.
+#         n_bins: Number of histogram bins.
+#
+#     Returns:
+#         Optimal threshold value.
+#     """
+#     # Handle edge cases
+#     if len(values) == 0:
+#         return 0.0
+#     if np.all(values == values[0]):
+#         return values[0]
+#
+#     # Compute histogram
+#     hist, bin_edges = np.histogram(values, bins=n_bins)
+#     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+#
+#     # Total number of samples and mean
+#     total = hist.sum()
+#     sum_total = np.sum(hist * bin_centers)
+#
+#     # Find threshold that maximizes between-class variance
+#     sum_bg = 0.0
+#     weight_bg = 0
+#     max_variance = 0.0
+#     threshold = bin_centers[0]
+#
+#     for i, (count, center) in enumerate(zip(hist, bin_centers)):
+#         weight_bg += count
+#         if weight_bg == 0:
+#             continue
+#
+#         weight_fg = total - weight_bg
+#         if weight_fg == 0:
+#             break
+#
+#         sum_bg += count * center
+#         mean_bg = sum_bg / weight_bg
+#         mean_fg = (sum_total - sum_bg) / weight_fg
+#
+#         # Between-class variance
+#         variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+#
+#         if variance > max_variance:
+#             max_variance = variance
+#             threshold = center
+#
+#     return threshold
 
-    Finds the threshold that maximizes between-class variance,
-    effectively separating the data into two classes (static/active).
+
+def _otsu_threshold_log(values: np.ndarray, n_bins: int = 256,
+                        eps: float = 1e-6) -> float:
+    """
+    Compute Otsu threshold after log-transforming the data.
+
+    This is useful for accelerometer metrics (variance, ENMO, etc.)
+    which often have heavy-tailed distributions where a log transform
+    makes the two modes (static / active) more separable.
 
     Args:
         values: 1D array of values to threshold.
         n_bins: Number of histogram bins.
+        eps:    Small constant added before log to avoid log(0).
 
     Returns:
-        Optimal threshold value.
+        Threshold in the ORIGINAL value scale.
     """
-    # Handle edge cases
     if len(values) == 0:
         return 0.0
     if np.all(values == values[0]):
-        return values[0]
+        return float(values[0])
 
-    # Compute histogram
-    hist, bin_edges = np.histogram(values, bins=n_bins)
+    log_vals = np.log(values + eps)
+    hist, bin_edges = np.histogram(log_vals, bins=n_bins)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
-    # Total number of samples and mean
     total = hist.sum()
     sum_total = np.sum(hist * bin_centers)
 
-    # Find threshold that maximizes between-class variance
     sum_bg = 0.0
     weight_bg = 0
     max_variance = 0.0
-    threshold = bin_centers[0]
+    threshold_log = bin_centers[0]
 
-    for i, (count, center) in enumerate(zip(hist, bin_centers)):
+    for count, center in zip(hist, bin_centers):
         weight_bg += count
         if weight_bg == 0:
             continue
-
         weight_fg = total - weight_bg
         if weight_fg == 0:
             break
-
         sum_bg += count * center
         mean_bg = sum_bg / weight_bg
         mean_fg = (sum_total - sum_bg) / weight_fg
-
-        # Between-class variance
         variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-
         if variance > max_variance:
             max_variance = variance
-            threshold = center
+            threshold_log = center
 
-    return threshold
+    # Convert back to original scale
+    return float(np.exp(threshold_log) - eps)
 
 
 def window_predictions_to_seconds(pred_walk: np.ndarray,
@@ -258,3 +311,128 @@ def _run_batch(batch: np.ndarray, model, device,
             preds = torch.argmax(preds, dim=1)
 
     return preds.cpu().numpy().flatten()
+
+
+def run_gait_detection_log(acc: np.ndarray, model, device,
+                           window_len: int, step_len: int,
+                           batch_size: int = 512,
+                           filter_static: bool = True) -> np.ndarray:
+    """
+    Run gait detection model on windowed acceleration data.
+
+    Args:
+        acc: Preprocessed acceleration (N, 3).
+        model: Gait detection model (classification, 2 outputs).
+        device: torch device.
+        window_len: Window length in samples.
+        step_len: Step between windows in samples.
+        batch_size: Inference batch size.
+        filter_static: If True, use Otsu's method to filter low-variance
+                       (static) windows before inference.
+
+    Returns:
+        Binary predictions per window (1=walking, 0=not).
+    """
+    # Extract windows
+    n_windows = max(0, (len(acc) - window_len) // step_len + 1)
+    if n_windows == 0:
+        return np.array([])
+
+    windows = np.array([acc[i * step_len: i * step_len + window_len]
+                        for i in range(n_windows)])
+
+    # Pre-filter: calculate variance per window (mean across 3 axes)
+    # Static signals have very low variance and can't be gait
+    window_variance = np.var(windows, axis=1).mean(axis=1)
+
+    # Adaptive threshold using Otsu's method to separate static/active windows
+    if filter_static:
+        variance_threshold = _otsu_threshold_log(window_variance)
+        active_mask = window_variance > variance_threshold
+    else:
+        active_mask = np.ones(n_windows, dtype=bool)
+        variance_threshold = 0.0
+
+    active_indices = np.where(active_mask)[0]
+
+    n_filtered = n_windows - len(active_indices)
+    if n_filtered > 0:
+        logger.debug(f"Filtered {n_filtered}/{n_windows} low-variance windows "
+                     f"(Otsu threshold={variance_threshold:.6f})")
+
+    # Initialize all predictions as non-gait
+    predictions = np.zeros(n_windows, dtype=int)
+
+    if len(active_indices) == 0:
+        return predictions
+
+    # Only run inference on active (high-variance) windows
+    active_windows = windows[active_indices]
+
+    active_preds = []
+    for i in range(0, len(active_windows), batch_size):
+        batch = active_windows[i:i + batch_size]
+        preds = _run_batch(batch, model, device, is_classification=True)
+        active_preds.extend(preds)
+
+    # Map predictions back to original indices
+    predictions[active_indices] = active_preds
+
+    return predictions
+
+
+def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+    """
+    Compute optimal threshold using Otsu's method.
+
+    Finds the threshold that maximizes between-class variance,
+    effectively separating the data into two classes (static/active).
+
+    Args:
+        values: 1D array of values to threshold.
+        n_bins: Number of histogram bins.
+
+    Returns:
+        Optimal threshold value.
+    """
+    # Handle edge cases
+    if len(values) == 0:
+        return 0.0
+    if np.all(values == values[0]):
+        return values[0]
+
+    # Compute histogram
+    hist, bin_edges = np.histogram(values, bins=n_bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Total number of samples and mean
+    total = hist.sum()
+    sum_total = np.sum(hist * bin_centers)
+
+    # Find threshold that maximizes between-class variance
+    sum_bg = 0.0
+    weight_bg = 0
+    max_variance = 0.0
+    threshold = bin_centers[0]
+
+    for i, (count, center) in enumerate(zip(hist, bin_centers)):
+        weight_bg += count
+        if weight_bg == 0:
+            continue
+
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+
+        sum_bg += count * center
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+
+        # Between-class variance
+        variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+
+        if variance > max_variance:
+            max_variance = variance
+            threshold = center
+
+    return threshold
