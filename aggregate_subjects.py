@@ -78,7 +78,7 @@ VAR_OF_VAR_METRICS = ['speed', 'cadence', 'gait_length', 'regularity_eldernet']
 CORE_METRICS = ['speed', 'cadence', 'gait_length', 'regularity_eldernet']
 
 # Minimum sample size for robust statistics
-MIN_SAMPLE_SIZE = 5
+MIN_SAMPLE_SIZE = 30
 
 # Bout-level metrics to compute summary statistics on
 BOUT_METRICS = [
@@ -178,9 +178,13 @@ def _calc_stats(data: np.ndarray, prefix: str) -> dict:
     data = data.flatten()
     data = data[np.isfinite(data)]
 
-    stat_names = ['median', 'mean', 'std', 'p5', 'p10', 'p90', 'p95',
+    # stat_names = ['median', 'mean', 'std', 'p5', 'p10', 'p90', 'p95',
+    #               'kurtosis', 'skewness', 'range', 'iqr', 'cv',
+    #               'mad', 'l_skewness', 'l_kurtosis']
+    stat_names = ['median', 'mean', 'std', 'p10', 'p90',
                   'kurtosis', 'skewness', 'range', 'iqr', 'cv',
                   'mad', 'l_skewness', 'l_kurtosis']
+
     nan_dict = {f'{prefix}{s}': np.nan for s in stat_names}
 
     if len(data) == 0:
@@ -209,10 +213,10 @@ def _calc_stats(data: np.ndarray, prefix: str) -> dict:
         f'{prefix}median': float(np.median(data)),
         f'{prefix}mean': float(mean_val),
         f'{prefix}std': float(np.std(data)),
-        f'{prefix}p5': float(np.percentile(data, 5)),
+        # f'{prefix}p5': float(np.percentile(data, 5)),
         f'{prefix}p10': float(np.percentile(data, 10)),
         f'{prefix}p90': float(np.percentile(data, 90)),
-        f'{prefix}p95': float(np.percentile(data, 95)),
+        # f'{prefix}p95': float(np.percentile(data, 95)),
         f'{prefix}kurtosis': float(kurtosis(data)) if n > 3 else np.nan,
         f'{prefix}skewness': float(skew(data)) if n > 3 else np.nan,
         f'{prefix}range': float(np.ptp(data)),
