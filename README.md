@@ -105,31 +105,7 @@ python aggregate_subjects.py --config config.yaml
 - Iterate on aggregation (add new summary measures, change bin ranges, etc.)
 - Re-aggregate without re-processing raw data
 
-## Bug Fixes from Original Code
 
-### 1. Bout Merging — fixed in gait_detection.py
-**Bug:** `merge_gait_bouts()` used a for-loop that mutated `bout_starts`/`bout_ends` during iteration. With 3+ close bouts, results depended on iteration order and could produce overlapping bouts.
-**Fix:** While-loop that correctly collapses chains of mergeable bouts.
-
-### 2. ElderNet Head Config — fixed in io_utils.py
-**Bug:** `setup_model()` did not forward `num_layers_regressor` or `batch_norm` to `ElderNet`. It silently used `num_layers=3` and `use_bn=True` defaults regardless of config.
-**Fix:** `setup_model()` now explicitly passes `num_layers` and `use_bn` from config.
-
-### 3. Inconsistent Preprocessing — fixed in preprocessing.py
-**Bug:** Main pipeline used `imputeMissing()` + `drop_first_last_days()`. Frequency/entropy scripts used simpler `reindex(method='nearest')`. These produce **different signals**.
-**Fix:** Single `preprocessing.py` used everywhere.
-
-### 4. Regularity on Overlapping Windows — fixed in signal_features.py
-**Bug:** SP regularity computed on each 10-sec window with 90% overlap. Consecutive windows share 9 seconds of data, producing highly autocorrelated estimates with deflated variance.
-**Fix:** SP regularity computed once per bout on the full bout signal.
-
-### 5. Step Count Formula — fixed in feature_extraction.py
-**Bug:** `adj_factor = 0.1 * (bout_len - 1) + 1; total = adj_factor * median_steps`. Hardcoded 90% overlap, used median (biased for skewed distributions).
-**Fix:** `total_steps = sum(per_window_steps) * (step_len / window_len)`. Works for any overlap, uses sum.
-
-### 6. Var-of-Var Alignment — fixed in aggregation.py
-**Bug:** Reconstructed bout-to-window mapping from durations + windowing constants. Failed silently when bout boundaries didn't align with window boundaries.
-**Fix:** Uses `bout_id` column directly from window CSV — no reconstruction needed.
 
 ## Dependencies
 
@@ -139,6 +115,3 @@ numpy scipy pandas torch tqdm pyyaml actipy mat73
 numba
 ```
 
-## Important Note on Model Weights
-
-The `setup_model()` fix in `io_utils.py` means `num_layers` is now correctly forwarded to ElderNet. If your trained weights were saved with the old code (which silently used `num_layers=3`), set `num_layers: 3` in `config.yaml` for all models to match. Mismatched architecture will crash at `load_state_dict`. Update only after confirming what each model was trained with.
