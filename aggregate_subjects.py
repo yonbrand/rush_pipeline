@@ -624,6 +624,67 @@ def _time_of_day_stats(bout_df: pd.DataFrame) -> dict:
 # Batch aggregation from saved CSVs
 # ============================================================================
 
+def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
+    """
+    Concatenate all bouts CSVs across devices into one DataFrame.
+
+    Expects the output directory to contain device subdirectories (e.g. geneactive/, axivity/),
+    each with a bouts/ folder inside:
+
+        output_dir/
+            geneactive/
+                bouts/
+                windows/
+                daily_pa/
+            axivity/
+                bouts/
+                windows/
+                daily_pa/
+
+    The device name is taken from the subdirectory name.
+
+    Args:
+        output_dir: Parent directory containing device subdirectories.
+        output_file: Optional path to save the concatenated CSV.
+
+    Returns:
+        DataFrame with all bouts, plus 'subject_id' and 'device' columns.
+    """
+    output_dir = Path(output_dir)
+
+    # Find all subdirectories that contain a bouts/ folder
+    device_dirs = [d for d in sorted(output_dir.iterdir()) if d.is_dir() and (d / 'bouts').exists()]
+
+    if not device_dirs:
+        raise FileNotFoundError(
+            f"No device subdirectories with a bouts/ folder found in {output_dir}"
+        )
+
+    all_dfs = []
+    for device_dir in device_dirs:
+        device = device_dir.name
+        bout_files = sorted((device_dir / 'bouts').glob('*.csv'))
+        logger.info(f"Device '{device}': found {len(bout_files)} bouts files")
+
+        for bout_file in bout_files:
+            df = pd.read_csv(bout_file)
+            df.insert(0, 'subject_id', bout_file.stem)
+            df.insert(1, 'device', device)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        logger.warning("No bouts files found.")
+        return pd.DataFrame()
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    if output_file:
+        combined.to_csv(output_file, index=False)
+        logger.info(f"Saved concatenated bouts to {output_file}")
+
+    return combined
+
+
 def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
     """
     Aggregate all subjects from a pipeline output directory.
@@ -700,6 +761,10 @@ def main():
         '--out-file', type=str, default='subject_summary.csv',
         help='Output filename (default: subject_summary.csv)'
     )
+    parser.add_argument(
+        '--concatenate-bouts', action='store_true',
+        help='Concatenate all bouts CSVs across devices into one file instead of aggregating'
+    )
     args = parser.parse_args()
 
     # Determine output directory
@@ -717,6 +782,16 @@ def main():
             output_dir = Path(cfg.data.output_path)
         except Exception:
             parser.error("Must specify --output-dir or --config")
+
+    if args.concatenate_bouts:
+        out_path = output_dir / args.out_file
+        logger.info(f"Concatenating bouts from: {output_dir}")
+        df = concatenate_bouts(str(output_dir), output_file=str(out_path))
+        print(f"\nConcatenation complete:")
+        print(f"  Rows: {len(df)}")
+        print(f"  Devices: {df['device'].unique().tolist()}")
+        print(f"  Output: {out_path}")
+        return
 
     logger.info(f"Aggregating from: {output_dir}")
 
