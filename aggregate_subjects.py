@@ -668,8 +668,10 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
 
         for bout_file in bout_files:
             df = pd.read_csv(bout_file)
-            df.insert(0, 'subject_id', bout_file.stem)
-            df.insert(1, 'device', device)
+            if 'subject_id' not in df.columns:
+                df.insert(0, 'subject_id', bout_file.stem)
+            if 'device' not in df.columns:
+                df.insert(1, 'device', device)
             all_dfs.append(df)
 
     if not all_dfs:
