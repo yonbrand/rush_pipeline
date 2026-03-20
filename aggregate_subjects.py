@@ -20,6 +20,7 @@ Output:
 
 import argparse
 import logging
+from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 
@@ -671,7 +672,8 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
             if 'subject_id' not in df.columns:
                 df.insert(0, 'subject_id', bout_file.stem)
             if 'device' not in df.columns:
-                df.insert(1, 'device', device)
+                sid_pos = df.columns.get_loc('subject_id')
+                df.insert(sid_pos + 1, 'device', device)
             all_dfs.append(df)
 
     if not all_dfs:
@@ -681,6 +683,7 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
     combined = pd.concat(all_dfs, ignore_index=True)
 
     if output_file:
+        output_file = _safe_output_path(output_file)
         combined.to_csv(output_file, index=False)
         logger.info(f"Saved concatenated bouts to {output_file}")
 
@@ -691,36 +694,61 @@ def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
     """
     Aggregate all subjects from a pipeline output directory.
 
-    Args:
-        output_dir: Path containing bouts/, windows/, daily_pa/ subdirectories.
+    Supports both flat and multi-device layouts:
+
+        Flat layout:
+            output_dir/bouts/, output_dir/windows/, output_dir/daily_pa/
+
+        Multi-device layout:
+            output_dir/<device>/bouts/, output_dir/<device>/windows/, output_dir/<device>/daily_pa/
+
+    In the multi-device layout, each device is processed separately and the
+    resulting rows include a 'device' column.
 
     Returns:
-        DataFrame with one row per subject.
+        DataFrame with one row per subject (per device in multi-device layout).
     """
     output_dir = Path(output_dir)
-    bout_dir = output_dir / 'bouts'
-    window_dir = output_dir / 'windows'
-    daily_pa_dir = output_dir / 'daily_pa'
 
-    if not bout_dir.exists():
-        raise FileNotFoundError(f"Bout directory not found: {bout_dir}")
+    # Detect layout: multi-device if any subdirectory contains a bouts/ folder
+    device_dirs = [d for d in sorted(output_dir.iterdir()) if d.is_dir() and (d / 'bouts').exists()]
+
+    if device_dirs:
+        # Multi-device layout
+        logger.info(f"Detected multi-device layout with devices: {[d.name for d in device_dirs]}")
+        all_results = []
+        for device_dir in device_dirs:
+            device_results = _aggregate_single_dir(device_dir, device=device_dir.name)
+            all_results.extend(device_results)
+        return pd.DataFrame(all_results)
+
+    # Flat layout
+    if not (output_dir / 'bouts').exists():
+        raise FileNotFoundError(
+            f"No bouts/ directory found in {output_dir}, and no device subdirectories detected."
+        )
+    results = _aggregate_single_dir(output_dir, device=None)
+    return pd.DataFrame(results)
+
+
+def _aggregate_single_dir(base_dir: Path, device: str | None) -> list[dict]:
+    """Aggregate all subjects from a single bouts/windows/daily_pa directory."""
+    bout_dir = base_dir / 'bouts'
+    window_dir = base_dir / 'windows'
+    daily_pa_dir = base_dir / 'daily_pa'
+
+    bout_files = sorted(bout_dir.glob('*.csv'))
+    logger.info(f"{'Device ' + repr(device) + ': ' if device else ''}Found {len(bout_files)} subjects to aggregate")
 
     results = []
-    bout_files = sorted(bout_dir.glob('*.csv'))
-
-    logger.info(f"Found {len(bout_files)} subjects to aggregate")
-
     for bout_file in bout_files:
         subject_id = bout_file.stem
 
-        # Load bout data
         bout_df = pd.read_csv(bout_file)
 
-        # Load window data
         window_file = window_dir / f'{subject_id}.csv'
         window_df = pd.read_csv(window_file) if window_file.exists() else pd.DataFrame()
 
-        # Load daily PA
         daily_pa_file = daily_pa_dir / f'{subject_id}.csv'
         daily_pa = {}
         num_days = 0
@@ -738,9 +766,30 @@ def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
             subject_id=subject_id,
             num_days=num_days,
         )
+        if device is not None:
+            row['device'] = device
         results.append(row)
 
-    return pd.DataFrame(results)
+    return results
+
+
+# ============================================================================
+# I/O helpers
+# ============================================================================
+
+def _safe_output_path(path) -> Path:
+    """
+    Return a path that does not overwrite an existing file.
+    If the path already exists, appends a timestamp suffix before the extension.
+    E.g. subject_summary.csv -> subject_summary_20260320_155301.csv
+    """
+    path = Path(path)
+    if not path.exists():
+        return path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    new_path = path.with_stem(f'{path.stem}_{timestamp}')
+    logger.warning(f"Output file already exists. Saving to {new_path} instead.")
+    return new_path
 
 
 # ============================================================================
@@ -760,8 +809,8 @@ def main():
         help='Path to config YAML to read output_path from'
     )
     parser.add_argument(
-        '--out-file', type=str, default='subject_summary.csv',
-        help='Output filename (default: subject_summary.csv)'
+        '--out-file', type=str, default=None,
+        help='Output filename (default: subject_summary.csv for aggregation, all_bouts.csv for concatenation)'
     )
     parser.add_argument(
         '--concatenate-bouts', action='store_true',
@@ -786,7 +835,8 @@ def main():
             parser.error("Must specify --output-dir or --config")
 
     if args.concatenate_bouts:
-        out_path = output_dir / args.out_file
+        out_filename = args.out_file or 'all_bouts.csv'
+        out_path = _safe_output_path(output_dir / out_filename)
         logger.info(f"Concatenating bouts from: {output_dir}")
         df = concatenate_bouts(str(output_dir), output_file=str(out_path))
         print(f"\nConcatenation complete:")
@@ -801,7 +851,8 @@ def main():
     df = aggregate_from_directory(str(output_dir))
 
     # Save
-    out_path = output_dir / args.out_file
+    out_filename = args.out_file or 'subject_summary.csv'
+    out_path = _safe_output_path(output_dir / out_filename)
     df.to_csv(out_path, index=False)
     logger.info(f"Done. {len(df)} subjects -> {out_path}")
 
