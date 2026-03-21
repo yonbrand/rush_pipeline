@@ -100,6 +100,7 @@ def aggregate_subject(
     daily_pa: dict,
     subject_id: str,
     num_days: int,
+    include_hist_bins: bool = False,
 ) -> dict:
     """
     Compute all summary statistics for one subject.
@@ -110,6 +111,8 @@ def aggregate_subject(
         daily_pa: dict with keys 'daily_pa_mean', 'daily_pa_std', 'tdpa' (arrays).
         subject_id: Subject identifier.
         num_days: Number of valid recording days.
+        include_hist_bins: If True, include per-bin frequency and probability columns
+                           for each bout metric. Defaults to False.
 
     Returns:
         dict with all summary statistics (one row of final output).
@@ -128,7 +131,8 @@ def aggregate_subject(
         if metric in bout_df.columns:
             data = bout_df[metric].dropna().values
             row.update(_calc_stats(data, prefix))
-            row.update(_histogram_features(data, prefix, metric))
+            if include_hist_bins:
+                row.update(_histogram_features(data, prefix, metric))
         else:
             row.update(_calc_stats(np.array([]), prefix))
 
@@ -147,13 +151,13 @@ def aggregate_subject(
     # --- Variance-of-variance (within-bout variability) ---
     row.update(_var_of_var(window_df))
 
-    # --- Daily physical activity ---
+    # --- Daily physical activity (robust stats excluded: too few observations per subject) ---
     for key in ['daily_pa_mean', 'daily_pa_std', 'tdpa']:
         data = daily_pa.get(key, np.array([]))
         if isinstance(data, np.ndarray) and data.size > 0:
-            row.update(_calc_stats(data, f'{key}_'))
+            row.update(_calc_stats(data, f'{key}_', robust=False))
         else:
-            row.update(_calc_stats(np.array([]), f'{key}_'))
+            row.update(_calc_stats(np.array([]), f'{key}_', robust=False))
 
     # --- Bout count ---
     row['n_bouts'] = len(bout_df)
@@ -165,26 +169,26 @@ def aggregate_subject(
 # Statistics helpers
 # ============================================================================
 
-def _calc_stats(data: np.ndarray, prefix: str) -> dict:
+def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
     """
     Compute descriptive statistics for an array.
 
-    Includes robust scale and shape metrics:
-    - MAD (Median Absolute Deviation)
-    - L-skewness (Tau-3) via L-moments
-    - L-kurtosis (Tau-4) via L-moments
+    Args:
+        data: Input array.
+        prefix: Column name prefix.
+        robust: If True, also compute MAD, L-skewness, and L-kurtosis.
+                Set to False for daily-level metrics (few observations) to
+                avoid blank columns in the output.
     """
     if not isinstance(data, np.ndarray):
         data = np.array(data, dtype=float)
     data = data.flatten()
     data = data[np.isfinite(data)]
 
-    # stat_names = ['median', 'mean', 'std', 'p5', 'p10', 'p90', 'p95',
-    #               'kurtosis', 'skewness', 'range', 'iqr', 'cv',
-    #               'mad', 'l_skewness', 'l_kurtosis']
-    stat_names = ['median', 'mean', 'std', 'p10', 'p90',
-                  'kurtosis', 'skewness', 'range', 'iqr', 'cv',
-                  'mad', 'l_skewness', 'l_kurtosis']
+    base_stat_names = ['median', 'mean', 'std', 'p10', 'p90',
+                       'kurtosis', 'skewness', 'range', 'iqr', 'cv']
+    robust_stat_names = ['mad', 'l_skewness', 'l_kurtosis']
+    stat_names = base_stat_names + (robust_stat_names if robust else [])
 
     nan_dict = {f'{prefix}{s}': np.nan for s in stat_names}
 
@@ -194,39 +198,41 @@ def _calc_stats(data: np.ndarray, prefix: str) -> dict:
     mean_val = np.mean(data)
     n = len(data)
 
-    # Compute MAD (Median Absolute Deviation)
-    mad_val = float(median_abs_deviation(data, nan_policy='omit')) if n >= MIN_SAMPLE_SIZE else np.nan
-
-    # Compute L-moments (L-skewness and L-kurtosis)
-    l_skew = np.nan
-    l_kurt = np.nan
-    if HAS_LMOMENTS and n >= MIN_SAMPLE_SIZE:
-        try:
-            # lmoments3.lmom_ratios returns [l1, l2, t3, t4, ...] where t3=L-skewness, t4=L-kurtosis
-            lmom_ratios = lm.lmom_ratios(data, nmom=4)
-            if len(lmom_ratios) >= 4:
-                l_skew = float(lmom_ratios[2]) if np.isfinite(lmom_ratios[2]) else np.nan
-                l_kurt = float(lmom_ratios[3]) if np.isfinite(lmom_ratios[3]) else np.nan
-        except Exception:
-            pass  # Keep NaN on any computation error
-
-    return {
+    result = {
         f'{prefix}median': float(np.median(data)),
         f'{prefix}mean': float(mean_val),
         f'{prefix}std': float(np.std(data)),
-        # f'{prefix}p5': float(np.percentile(data, 5)),
         f'{prefix}p10': float(np.percentile(data, 10)),
         f'{prefix}p90': float(np.percentile(data, 90)),
-        # f'{prefix}p95': float(np.percentile(data, 95)),
         f'{prefix}kurtosis': float(kurtosis(data)) if n > 3 else np.nan,
         f'{prefix}skewness': float(skew(data)) if n > 3 else np.nan,
         f'{prefix}range': float(np.ptp(data)),
         f'{prefix}iqr': float(np.percentile(data, 75) - np.percentile(data, 25)),
         f'{prefix}cv': float(np.std(data) / mean_val) if mean_val != 0 else np.nan,
-        f'{prefix}mad': mad_val,
-        f'{prefix}l_skewness': l_skew,
-        f'{prefix}l_kurtosis': l_kurt,
     }
+
+    if robust:
+        # Compute MAD (Median Absolute Deviation)
+        mad_val = float(median_abs_deviation(data, nan_policy='omit')) if n >= MIN_SAMPLE_SIZE else np.nan
+
+        # Compute L-moments (L-skewness and L-kurtosis)
+        l_skew = np.nan
+        l_kurt = np.nan
+        if HAS_LMOMENTS and n >= MIN_SAMPLE_SIZE:
+            try:
+                # lmoments3.lmom_ratios returns [l1, l2, t3, t4, ...] where t3=L-skewness, t4=L-kurtosis
+                lmom_ratios = lm.lmom_ratios(data, nmom=4)
+                if len(lmom_ratios) >= 4:
+                    l_skew = float(lmom_ratios[2]) if np.isfinite(lmom_ratios[2]) else np.nan
+                    l_kurt = float(lmom_ratios[3]) if np.isfinite(lmom_ratios[3]) else np.nan
+            except Exception:
+                pass  # Keep NaN on any computation error
+
+        result[f'{prefix}mad'] = mad_val
+        result[f'{prefix}l_skewness'] = l_skew
+        result[f'{prefix}l_kurtosis'] = l_kurt
+
+    return result
 
 
 def _histogram_features(data: np.ndarray, prefix: str, metric_name: str,
@@ -304,31 +310,31 @@ def _var_of_var(window_df: pd.DataFrame) -> dict:
 def _daily_walking_stats(bout_df: pd.DataFrame, prefix: str) -> dict:
     """Compute daily walking minutes statistics."""
     if bout_df.empty or 'start_time' not in bout_df.columns:
-        return _calc_stats(np.array([]), prefix)
+        return _calc_stats(np.array([]), prefix, robust=False)
 
     try:
         df = bout_df.copy()
         df['start_time'] = pd.to_datetime(df['start_time'])
         df['day'] = df['start_time'].dt.date
         daily_walking_min = df.groupby('day')['duration_sec'].sum() / 60
-        return _calc_stats(daily_walking_min.values, prefix)
+        return _calc_stats(daily_walking_min.values, prefix, robust=False)
     except Exception:
-        return _calc_stats(np.array([]), prefix)
+        return _calc_stats(np.array([]), prefix, robust=False)
 
 
 def _daily_step_stats(bout_df: pd.DataFrame, prefix: str) -> dict:
     """Compute daily step count statistics."""
     if bout_df.empty or 'start_time' not in bout_df.columns:
-        return _calc_stats(np.array([]), prefix)
+        return _calc_stats(np.array([]), prefix, robust=False)
 
     try:
         df = bout_df.copy()
         df['start_time'] = pd.to_datetime(df['start_time'])
         df['day'] = df['start_time'].dt.date
         daily_steps = df.groupby('day')['total_steps'].sum()
-        return _calc_stats(daily_steps.values, prefix)
+        return _calc_stats(daily_steps.values, prefix, robust=False)
     except Exception:
-        return _calc_stats(np.array([]), prefix)
+        return _calc_stats(np.array([]), prefix, robust=False)
 
 
 # ============================================================================
@@ -690,7 +696,7 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
     return combined
 
 
-def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
+def aggregate_from_directory(output_dir: str, include_hist_bins: bool = False) -> pd.DataFrame:
     """
     Aggregate all subjects from a pipeline output directory.
 
@@ -705,6 +711,11 @@ def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
     In the multi-device layout, each device is processed separately and the
     resulting rows include a 'device' column.
 
+    Args:
+        output_dir: Path to the pipeline output directory.
+        include_hist_bins: If True, include per-bin frequency and probability columns
+                           for each bout metric.
+
     Returns:
         DataFrame with one row per subject (per device in multi-device layout).
     """
@@ -718,7 +729,8 @@ def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
         logger.info(f"Detected multi-device layout with devices: {[d.name for d in device_dirs]}")
         all_results = []
         for device_dir in device_dirs:
-            device_results = _aggregate_single_dir(device_dir, device=device_dir.name)
+            device_results = _aggregate_single_dir(device_dir, device=device_dir.name,
+                                                   include_hist_bins=include_hist_bins)
             all_results.extend(device_results)
         return pd.DataFrame(all_results)
 
@@ -727,11 +739,12 @@ def aggregate_from_directory(output_dir: str) -> pd.DataFrame:
         raise FileNotFoundError(
             f"No bouts/ directory found in {output_dir}, and no device subdirectories detected."
         )
-    results = _aggregate_single_dir(output_dir, device=None)
+    results = _aggregate_single_dir(output_dir, device=None, include_hist_bins=include_hist_bins)
     return pd.DataFrame(results)
 
 
-def _aggregate_single_dir(base_dir: Path, device: str | None) -> list[dict]:
+def _aggregate_single_dir(base_dir: Path, device: str | None,
+                          include_hist_bins: bool = False) -> list[dict]:
     """Aggregate all subjects from a single bouts/windows/daily_pa directory."""
     bout_dir = base_dir / 'bouts'
     window_dir = base_dir / 'windows'
@@ -765,6 +778,7 @@ def _aggregate_single_dir(base_dir: Path, device: str | None) -> list[dict]:
             daily_pa=daily_pa,
             subject_id=subject_id,
             num_days=num_days,
+            include_hist_bins=include_hist_bins,
         )
         if device is not None:
             row['device'] = device
@@ -816,6 +830,10 @@ def main():
         '--concatenate-bouts', action='store_true',
         help='Concatenate all bouts CSVs across devices into one file instead of aggregating'
     )
+    parser.add_argument(
+        '--include-hist-bins', action='store_true', default=False,
+        help='Include per-bin frequency and probability columns for each bout metric (default: off)'
+    )
     args = parser.parse_args()
 
     # Determine output directory
@@ -848,7 +866,7 @@ def main():
     logger.info(f"Aggregating from: {output_dir}")
 
     # Run aggregation
-    df = aggregate_from_directory(str(output_dir))
+    df = aggregate_from_directory(str(output_dir), include_hist_bins=args.include_hist_bins)
 
     # Save
     out_filename = args.out_file or 'subject_summary.csv'
