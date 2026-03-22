@@ -767,6 +767,12 @@ def _aggregate_single_dir(base_dir: Path, device: str | None,
 
         bout_df = pd.read_csv(bout_file)
 
+        # Backward-compat: rename old column names from existing CSVs
+        bout_df.rename(columns={
+            'bout_pa_mean': 'pa_amplitude',
+            'bout_pa_std': 'pa_variability',
+        }, inplace=True)
+
         # Filter outlier bouts
         n_before = len(bout_df)
         if 'duration_sec' in bout_df.columns:
