@@ -228,25 +228,42 @@ def compute_psd_features(signal_data: np.ndarray, fs: float,
         return nans
 
     try:
+        # Demean to remove DC component (gravity offset in acc magnitude)
+        signal_data = signal_data - np.mean(signal_data)
+
         f, psd = welch(signal_data, fs=fs, nperseg=min(nperseg, len(signal_data)))
 
-        # Dominant frequency & amplitude
-        idx = np.argmax(psd)
-        dom_freq = f[idx]
-        amp = psd[idx]
+        # Restrict to gait-relevant band (>0 Hz excludes DC; upper bound covers
+        # running cadence at ~3 Hz stride freq = 6 Hz step freq with margin)
+        gait_mask = (f >= 0.5) & (f <= 6.0)
+        if not np.any(gait_mask):
+            return nans
+        f_gait = f[gait_mask]
+        psd_gait = psd[gait_mask]
 
-        # Width at half maximum
+        # Dominant frequency & amplitude within gait band
+        idx_gait = np.argmax(psd_gait)
+        dom_freq = f_gait[idx_gait]
+        amp = psd_gait[idx_gait]
+
+        # Width at half maximum — walk outward from peak, guard array edges
         half_max = amp / 2
-        left_idx = idx
-        while left_idx > 0 and psd[left_idx] > half_max:
+        left_idx = idx_gait
+        while left_idx > 0 and psd_gait[left_idx] > half_max:
             left_idx -= 1
-        right_idx = idx
-        while right_idx < len(psd) - 1 and psd[right_idx] > half_max:
+        right_idx = idx_gait
+        while right_idx < len(psd_gait) - 1 and psd_gait[right_idx] > half_max:
             right_idx += 1
 
-        width = f[right_idx] - f[left_idx]
-        if width == 0:
+        # If either boundary was hit without crossing half_max, width is unreliable
+        left_hit_edge = left_idx == 0 and psd_gait[0] > half_max
+        right_hit_edge = right_idx == len(psd_gait) - 1 and psd_gait[-1] > half_max
+        if left_hit_edge or right_hit_edge:
             width = np.nan
+        else:
+            width = f_gait[right_idx] - f_gait[left_idx]
+            if width == 0:
+                width = np.nan
 
         slope = amp / width if (width and not np.isnan(width)) else np.nan
 
