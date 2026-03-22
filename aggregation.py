@@ -49,7 +49,7 @@ GLOBAL_RANGES = {
     'psd_amp':              {'min': 0,   'max': 2.5},
     'psd_width':            {'min': 0,   'max': 1.0},
     'psd_slope':            {'min': 0,   'max': 300},
-    'bout_pa_mean':         {'min': 0.8, 'max': 2.0},
+    'pa_amplitude':         {'min': 0.8, 'max': 2.0},
 }
 
 N_BINS = 10
@@ -121,7 +121,7 @@ def aggregate_subject(
         'duration_sec', 'speed', 'cadence', 'gait_length', 'gait_length_indirect',
         'regularity_eldernet', 'regularity_sp', 'entropy',
         'dom_freq', 'psd_amp', 'psd_width', 'psd_slope',
-        'bout_pa_mean', 'bout_pa_std', 'total_steps',
+        'pa_amplitude', 'pa_variability', 'total_steps',
     ]
     for metric in bout_metrics:
         prefix = f'bout_{metric}_'

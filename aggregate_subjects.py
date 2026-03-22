@@ -67,7 +67,7 @@ GLOBAL_RANGES = {
     'psd_amp':              {'min': 0,   'max': 2.5},
     'psd_width':            {'min': 0,   'max': 1.0},
     'psd_slope':            {'min': 0,   'max': 300},
-    'bout_pa_mean':         {'min': 0.8, 'max': 2.0},
+    'pa_amplitude':         {'min': 0.8, 'max': 2.0},
 }
 
 N_BINS = 10
@@ -86,7 +86,7 @@ BOUT_METRICS = [
     'duration_sec', 'speed', 'cadence', 'gait_length', 'gait_length_indirect',
     'regularity_eldernet', 'regularity_sp', 'entropy',
     'dom_freq', 'psd_amp', 'psd_width', 'psd_slope',
-    'bout_pa_mean', 'bout_pa_std', 'total_steps',
+    'pa_amplitude', 'pa_variability', 'total_steps',
 ]
 
 
@@ -732,15 +732,23 @@ def aggregate_from_directory(output_dir: str, include_hist_bins: bool = False) -
             device_results = _aggregate_single_dir(device_dir, device=device_dir.name,
                                                    include_hist_bins=include_hist_bins)
             all_results.extend(device_results)
-        return pd.DataFrame(all_results)
+        df = pd.DataFrame(all_results)
+    else:
+        # Flat layout
+        if not (output_dir / 'bouts').exists():
+            raise FileNotFoundError(
+                f"No bouts/ directory found in {output_dir}, and no device subdirectories detected."
+            )
+        results = _aggregate_single_dir(output_dir, device=None, include_hist_bins=include_hist_bins)
+        df = pd.DataFrame(results)
 
-    # Flat layout
-    if not (output_dir / 'bouts').exists():
-        raise FileNotFoundError(
-            f"No bouts/ directory found in {output_dir}, and no device subdirectories detected."
-        )
-    results = _aggregate_single_dir(output_dir, device=None, include_hist_bins=include_hist_bins)
-    return pd.DataFrame(results)
+    # Drop columns that are completely empty (all NaN)
+    empty_cols = [c for c in df.columns if df[c].isna().all()]
+    if empty_cols:
+        logger.info(f"Dropping {len(empty_cols)} completely empty columns: {empty_cols}")
+        df = df.drop(columns=empty_cols)
+
+    return df
 
 
 def _aggregate_single_dir(base_dir: Path, device: str | None,
@@ -758,6 +766,16 @@ def _aggregate_single_dir(base_dir: Path, device: str | None,
         subject_id = bout_file.stem
 
         bout_df = pd.read_csv(bout_file)
+
+        # Filter outlier bouts
+        n_before = len(bout_df)
+        if 'duration_sec' in bout_df.columns:
+            bout_df = bout_df[bout_df['duration_sec'] <= 10000]
+        if 'pa_amplitude' in bout_df.columns:
+            bout_df = bout_df[bout_df['pa_amplitude'] <= 5]
+        n_dropped = n_before - len(bout_df)
+        if n_dropped > 0:
+            logger.info(f"  {subject_id}: dropped {n_dropped} outlier bouts (duration>10000s or PA>5)")
 
         window_file = window_dir / f'{subject_id}.csv'
         window_df = pd.read_csv(window_file) if window_file.exists() else pd.DataFrame()

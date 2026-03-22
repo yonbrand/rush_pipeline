@@ -111,8 +111,8 @@ def extract_features_for_subject(
                                    nperseg=frequency_cfg['nperseg'])
 
         # Intensity
-        bout_pa_mean = float(np.mean(bout_vm))
-        bout_pa_std = float(np.std(bout_vm))
+        pa_amplitude = float(np.mean(bout_vm))
+        pa_variability = float(np.std(bout_vm))
 
         # --- Timestamps ---
         bout_start_time = df_index[s_start] if s_start < len(df_index) else None
@@ -180,8 +180,8 @@ def extract_features_for_subject(
             'psd_width': psd['psd_width'],
             'psd_slope': psd['psd_slope'],
             # Intensity
-            'bout_pa_mean': bout_pa_mean,
-            'bout_pa_std': bout_pa_std,
+            'pa_amplitude': pa_amplitude,
+            'pa_variability': pa_variability,
         })
 
     return all_window_rows, all_bout_rows
