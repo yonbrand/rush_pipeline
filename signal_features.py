@@ -77,7 +77,7 @@ def calc_regularity(acc_magnitude: np.ndarray, sample_rate: float) -> float:
     pks, locs = _correct_peaks(normalized_c, pks, locs)
 
     if pks.size > 1:
-        return float(pks[1])  # Second peak = stride regularity
+        return max(0.0, float(pks[1]))  # Second peak = stride regularity
     return 0.0
 
 
