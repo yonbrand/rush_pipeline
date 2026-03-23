@@ -45,7 +45,8 @@ print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
 # ── Define feature buckets ────────────────────────────────────────────────
 id_cols = ["sub_id", "projid", "fu_year", "wear_days", "study"]
-daily_pa_cols = [c for c in df.columns if c.startswith("daily_")]
+daily_pa_cols = [c for c in df.columns
+                 if c.startswith("daily_pa_mean_") or c.startswith("daily_pa_std_") or c.startswith("tdpa_")]
 
 # Exclude all outcome / clinical / demographic columns from gait features
 exclude_from_features = set(id_cols + daily_pa_cols + [
@@ -66,7 +67,9 @@ exclude_from_features = set(id_cols + daily_pa_cols + [
     "is", "iv", "kar", "kra", "age_at_visit",
 ])
 gait_bout_cols = [c for c in df.columns if c not in exclude_from_features
-                  and not c.startswith("daily_")]
+                  and not c.startswith("daily_pa_mean_")
+                  and not c.startswith("daily_pa_std_")
+                  and not c.startswith("tdpa_")]
 demographic_cols = ["age_bl", "msex", "educ"]
 
 print(f"Gait bout features: {len(gait_bout_cols)}")
