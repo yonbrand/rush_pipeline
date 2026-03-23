@@ -175,7 +175,8 @@ if EXPORT_POSTMORTEM:
 # ═══════════════════════════════════════════════════════════════════════════
 # Feature bucket summary
 # ═══════════════════════════════════════════════════════════════════════════
-daily_pa_cols = [c for c in gait.columns if c.startswith("daily_")]
+daily_pa_cols = [c for c in gait.columns
+                 if c.startswith("daily_pa_mean_") or c.startswith("daily_pa_std_") or c.startswith("tdpa_")]
 id_cols = ["sub_id", "projid", "fu_year", "wear_days"]
 gait_bout_cols = [c for c in gait.columns
                   if c not in id_cols and c not in daily_pa_cols]
