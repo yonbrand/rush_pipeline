@@ -33,7 +33,7 @@ models:
     output_size: 2
     is_classification: true
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/SSL/ElderNet/outputs/gait_detection_mobD_cap24.pt"
+    trained_model_path: "models/gait_detection_model.pt"
     name_start_idx: 0
 
   step_count:
@@ -45,7 +45,7 @@ models:
     batch_norm: true
     max_mu: 25
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/gait-speed/outputs/step_count/TVS_ElderNet_pretrained_True_data_10_overlap_9Sec/final_training/final_model.pt"
+    trained_model_path: "models/step_count_model.pt"
     name_start_idx: 0
 
   gait_speed:
@@ -57,7 +57,7 @@ models:
     batch_norm: false
     max_mu: 2.0
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/gait-speed/outputs/gait_speed/TVS_ElderNet_pretrained_True_data_10_overlap_9Sec/final_training/final_model_paper.pt"
+    trained_model_path: "models/gait_speed_model.pt"
     name_start_idx: 0
 
   cadence:
@@ -69,7 +69,7 @@ models:
     batch_norm: true
     max_mu: 160
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/gait-speed/outputs/cadence/TVS_ElderNet_pretrained_True_data_10_overlap_9Sec/final_training/final_model.pt"
+    trained_model_path: "models/cadence_model.pt"
     name_start_idx: 0
 
   gait_length:
@@ -81,7 +81,7 @@ models:
     batch_norm: true
     max_mu: 2.0
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/gait-speed/outputs/gait_length/TVS_ElderNet_pretrained_True_data_10_overlap_9Sec/final_training/final_model.pt"
+    trained_model_path: "models/stride_length_model.pt"
     name_start_idx: 0
 
   regularity:
@@ -93,9 +93,9 @@ models:
     batch_norm: false
     max_mu: 1.0
     pretrained: true
-    trained_model_path: "N:/Gait-Neurodynamics by Names/Yonatan/gait-speed/outputs/regularity/TVS_ElderNet_pretrained_True_data_10_overlap_9Sec/final_training/final_model.pt"
+    trained_model_path: "models/regularity_model.pt"
     name_start_idx: 0
 
 data:
-  data_path: "N:/Projects/RUSH/Data/GENEActive_mat"
-  output_path: "N:/Gait-Neurodynamics by Names/Yonatan/RUSH/output_data"
+  data_path: "data/input"      # Path to input .mat files (GENEActive or Axivity)
+  output_path: "data/output"   # Path for pipeline output
