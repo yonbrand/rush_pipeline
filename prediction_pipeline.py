@@ -1,9 +1,10 @@
 """
-Cross-sectional prediction pipeline: gait metrics → clinical outcomes.
+Cross-sectional prediction pipeline: gait metrics -> clinical outcomes.
+Uses ABL (analytic baseline) data only — one visit per subject.
 
 Outcomes:
-  Binary:     parkinsonism_yn, mobility_disability_binary, falls_binary_final,
-              cognitive_impairment_final
+  Binary:     parkinsonism_yn, mobility_disability_binary, falls_binary,
+              cognitive_impairment
   Continuous: parksc, motor10, cogn_global
 
 Models:
@@ -39,7 +40,7 @@ except ImportError:
     print("WARNING: xgboost not installed — skipping XGBoost models")
 
 # ── Load data ──────────────────────────────────────────────────────────────
-df = pd.read_csv("output/merged_gait_clinical.csv")
+df = pd.read_csv("output/merged_gait_clinical_abl.csv")
 print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
 # ── Define feature buckets ────────────────────────────────────────────────
@@ -48,17 +49,21 @@ daily_pa_cols = [c for c in df.columns if c.startswith("daily_")]
 
 # Exclude all outcome / clinical / demographic columns from gait features
 exclude_from_features = set(id_cols + daily_pa_cols + [
-    "age_bl", "msex", "educ", "race7", "study",
-    "parkinsonism_yn", "dcfdx_3gp", "dcfdx", "dementia",
-    "rosbsum", "falls", "falls_binary", "falls_binary_from_falls",
-    "falls_binary_final", "mobility_disability_binary",
-    "cognitive_impairment_binary", "cognitive_impairment_from_3gp",
-    "cognitive_impairment_final",
+    "age_bl", "msex", "educ", "race7", "study", "device", "sub_id",
+    "parkinsonism_yn", "dcfdx", "dementia", "cpd_ever", "cogdx",
+    "rosbsum", "falls", "falls_binary", "mobility_disability_binary",
+    "cognitive_impairment",
     "cogn_global", "cogn_ep", "cogn_po", "cogn_ps", "cogn_se", "cogn_wo",
-    "cts_mmse30", "parksc", "motor10", "gait_speed",
+    "cogng_demog_slope", "time_lastce2dod", "age_death",
+    "cts_mmse30", "parksc", "motor10", "gait_speed", "scaled_to",
+    "pert_noact_avg", "tactivity_acth_avgnew", "tactivity_d_avgnew",
     "gaitsc", "bradysc", "rigidsc", "tremsc",
     "r_depres", "bmi", "med_con_sum_cum", "vasc_risks_sum",
-    "iadlsum", "katzsum", "device", "sub_id",
+    "iadlsum", "katzsum", "late_life_cogact_freq", "phys5itemsum",
+    "late_life_soc_act", "park_rx",
+    "motor10_demog_slope", "sqrt_parksc_demog_slope",
+    "motor_dexterity", "motor_gait", "motor_handstreng",
+    "is", "iv", "kar", "kra",
 ])
 gait_bout_cols = [c for c in df.columns if c not in exclude_from_features
                   and not c.startswith("daily_")]
@@ -71,8 +76,8 @@ print(f"Daily PA features:  {len(daily_pa_cols)}")
 BINARY_OUTCOMES = {
     "parkinsonism_yn": "Parkinsonism",
     "mobility_disability_binary": "Mobility Disability",
-    "falls_binary_final": "Falls",
-    "cognitive_impairment_final": "Cognitive Impairment",
+    "falls_binary": "Falls",
+    "cognitive_impairment": "Cognitive Impairment",
 }
 CONTINUOUS_OUTCOMES = {
     "parksc": "Parkinsonism Score",
