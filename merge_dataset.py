@@ -58,6 +58,10 @@ def derive_binary_outcomes(merged):
     else:
         merged["cognitive_impairment"] = np.nan
 
+    # Age at visit
+    if "age_bl" in merged.columns:
+        merged["age_at_visit"] = merged["age_bl"] + merged["fu_year"]
+
     return merged
 
 
@@ -112,6 +116,7 @@ if EXPORT_LV:
     demo_cols = ["projid", "age_bl", "msex", "educ", "race7"]
     demo = abl[demo_cols].drop_duplicates(subset="projid")
     merged_lv = merged_lv.merge(demo, on="projid", how="left")
+    merged_lv["age_at_visit"] = merged_lv["age_bl"] + merged_lv["fu_year"]
 
     print(f"\n[LV] Merged: {merged_lv.shape[0]} rows, {merged_lv.shape[1]} cols")
     print(f"  Unique subjects: {merged_lv['projid'].nunique()}")
@@ -137,6 +142,7 @@ if EXPORT_ALL_VISITS:
     demo_cols = ["projid", "age_bl", "msex", "educ", "race7"]
     demo = abl[demo_cols].drop_duplicates(subset="projid")
     merged_allv = merged_allv.merge(demo, on="projid", how="left")
+    merged_allv["age_at_visit"] = merged_allv["age_bl"] + merged_allv["fu_year"]
 
     print(f"\n[ALL VISITS] Merged: {merged_allv.shape[0]} rows, {merged_allv.shape[1]} cols")
     print(f"  Unique subjects: {merged_allv['projid'].nunique()}")
