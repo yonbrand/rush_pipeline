@@ -631,6 +631,29 @@ def _time_of_day_stats(bout_df: pd.DataFrame) -> dict:
 # Batch aggregation from saved CSVs
 # ============================================================================
 
+def _preprocess_bout_df(df: pd.DataFrame, subject_id: str = None) -> pd.DataFrame:
+    """
+    Apply standard preprocessing to a bout DataFrame:
+    - Rename legacy column names (bout_pa_mean -> pa_amplitude, bout_pa_std -> pa_variability)
+    - Filter outlier bouts (duration > 10000s or pa_amplitude > 5)
+    """
+    df.rename(columns={
+        'bout_pa_mean': 'pa_amplitude',
+        'bout_pa_std': 'pa_variability',
+    }, inplace=True)
+
+    n_before = len(df)
+    if 'duration_sec' in df.columns:
+        df = df[df['duration_sec'] <= 10000]
+    if 'pa_amplitude' in df.columns:
+        df = df[df['pa_amplitude'] <= 5]
+    n_dropped = n_before - len(df)
+    if n_dropped > 0:
+        label = f"  {subject_id}: " if subject_id else "  "
+        logger.info(f"{label}dropped {n_dropped} outlier bouts (duration>10000s or PA>5)")
+
+    return df
+
 def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
     """
     Concatenate all bouts CSVs across devices into one DataFrame.
@@ -680,6 +703,9 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
             if 'device' not in df.columns:
                 sid_pos = df.columns.get_loc('subject_id')
                 df.insert(sid_pos + 1, 'device', device)
+
+            # Apply standard preprocessing (rename + outlier filtering)
+            df = _preprocess_bout_df(df, subject_id=bout_file.stem)
             all_dfs.append(df)
 
     if not all_dfs:
@@ -751,7 +777,7 @@ def aggregate_from_directory(output_dir: str, include_hist_bins: bool = False) -
     return df
 
 
-def _aggregate_single_dir(base_dir: Path, device: str | None,
+def _aggregate_single_dir(base_dir: Path, device: str = None,
                           include_hist_bins: bool = False) -> list[dict]:
     """Aggregate all subjects from a single bouts/windows/daily_pa directory."""
     bout_dir = base_dir / 'bouts'
@@ -766,6 +792,9 @@ def _aggregate_single_dir(base_dir: Path, device: str | None,
         subject_id = bout_file.stem
 
         bout_df = pd.read_csv(bout_file)
+
+        # Apply standard preprocessing (rename + outlier filtering)
+        bout_df = _preprocess_bout_df(bout_df, subject_id=subject_id)
 
         # Backward-compat: rename old column names from existing CSVs
         bout_df.rename(columns={
