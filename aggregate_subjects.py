@@ -774,6 +774,12 @@ def aggregate_from_directory(output_dir: str, include_hist_bins: bool = False) -
         logger.info(f"Dropping {len(empty_cols)} completely empty columns: {empty_cols}")
         df = df.drop(columns=empty_cols)
 
+    # --- Split subject_id into projid and fu_year ---
+    if 'sub_id' in df.columns:
+        split_vals = df['sub_id'].str.split('_', n=1, expand=True)
+        df.insert(df.columns.get_loc('sub_id') + 1, 'projid', split_vals[0])
+        df.insert(df.columns.get_loc('projid') + 1, 'fu_year', split_vals[1])
+
     return df
 
 
