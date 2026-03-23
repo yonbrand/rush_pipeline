@@ -15,9 +15,9 @@ import torch
 from pathlib import Path
 
 # ── Configure these ──────────────────────────────────────────────────────────
-CONFIG_PATH = r"N:\Gait-Neurodynamics by Names\Yonatan\RUSH\rush_pipeline\config.yaml"
-SINGLE_FILE = r"N:\Projects\RUSH\Data\GENEActive_mat\02371278-00-05042018_left wrist_038073_2018-05-22 17-15-39.mat"  # ← pick one real file
-OUTPUT_DIR  = r"N:\Gait-Neurodynamics by Names\Yonatan\RUSH\rush_pipeline\debug_output"
+CONFIG_PATH = "config.yaml"
+SINGLE_FILE = "<path-to-your-mat-file>"  # ← pick one real .mat file
+OUTPUT_DIR  = "debug_output"
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.DEBUG,   # DEBUG = maximum verbosity
