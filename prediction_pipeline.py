@@ -63,7 +63,7 @@ exclude_from_features = set(id_cols + daily_pa_cols + [
     "late_life_soc_act", "park_rx",
     "motor10_demog_slope", "sqrt_parksc_demog_slope",
     "motor_dexterity", "motor_gait", "motor_handstreng",
-    "is", "iv", "kar", "kra",
+    "is", "iv", "kar", "kra", "age_at_visit",
 ])
 gait_bout_cols = [c for c in df.columns if c not in exclude_from_features
                   and not c.startswith("daily_")]
