@@ -110,7 +110,7 @@ gait_bout_cols = [
     and not c.startswith("daily_pa_std_")
     and not c.startswith("tdpa_")
 ]
-demographic_cols = ["age_bl", "msex", "educ"]
+demographic_cols = ["age_at_visit", "msex", "educ"]
 
 print(f"Gait bout features: {len(gait_bout_cols)}")
 print(f"Daily PA features:  {len(daily_pa_cols)}")
@@ -132,6 +132,14 @@ FEATURE_SETS = {
     "Gait Bout": gait_bout_cols,
     "Daily PA": daily_pa_cols,
     "Combined": gait_bout_cols + daily_pa_cols,
+}
+
+# Regression-only feature sets: clinical gait speed baseline & augmented combined
+# NOTE: gait_speed (8-foot walk test) may partially overlap with parksc/motor10
+#       scoring — interpret those outcomes with caution (see limitations).
+REGRESSION_EXTRA_FEATURE_SETS = {
+    "8ft Gait Speed (baseline)": ["gait_speed"],
+    "Combined + 8ft Speed": gait_bout_cols + daily_pa_cols + ["gait_speed"],
 }
 
 SELECTION_STRATEGIES = [
@@ -368,14 +376,23 @@ def prepare_data(df, feature_cols, outcome_col, demographics=True):
 # Nested cross-validation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_nested_cv(X, y, task_type, outcome_name, feature_set_name):
+def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
+                   selection_strategies=None):
     """
     Nested CV over all (selection × model) combinations for one
     outcome × feature-set pair.
 
     Outer loop: unbiased performance estimation (5×3 repeated K-fold)
-    Inner loop: hyperparameter tuning via 5-fold GridSearchCV
+    Inner loop: hyperparameter tuning via 3-fold GridSearchCV
+
+    Parameters
+    ----------
+    selection_strategies : list[str] or None
+        Subset of SELECTION_STRATEGIES to evaluate.  Defaults to all.
+        Use ["No Selection"] for baseline feature sets with few features.
     """
+    if selection_strategies is None:
+        selection_strategies = SELECTION_STRATEGIES
     if task_type == "classification":
         outer_cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=42)
         inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
@@ -399,7 +416,7 @@ def run_nested_cv(X, y, task_type, outcome_name, feature_set_name):
 
     results = []
 
-    for sel_name in SELECTION_STRATEGIES:
+    for sel_name in selection_strategies:
         for model_name, (model_instance, model_params) in model_defs.items():
             try:
                 pipe, grid = build_pipeline_and_grid(
@@ -530,6 +547,8 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
     print(f"\n{'─'*70}")
     print(f"  {outcome_name} ({outcome_col})")
     print(f"{'─'*70}")
+
+    # Sensor-based feature sets (full selection strategy sweep)
     for fs_name, fs_cols in FEATURE_SETS.items():
         X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50:
@@ -538,6 +557,23 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
         print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}")
 
         results = run_nested_cv(X, y, "regression", outcome_name, fs_name)
+        all_reg_results.extend(results)
+
+    # Clinical baseline & augmented feature sets
+    for fs_name, fs_cols in REGRESSION_EXTRA_FEATURE_SETS.items():
+        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        if len(y) < 50:
+            print(f"  {fs_name}: skipped (n={len(y)})")
+            continue
+        # For the baseline (few features), only "No Selection" is meaningful;
+        # for the augmented combined set, run the full sweep.
+        is_baseline = (len(fs_cols) <= 3)
+        sel = ["No Selection"] if is_baseline else None
+        print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}"
+              + (" [baseline — No Selection only]" if is_baseline else ""))
+
+        results = run_nested_cv(X, y, "regression", outcome_name, fs_name,
+                                selection_strategies=sel)
         all_reg_results.extend(results)
 
 # ── Save results ─────────────────────────────────────────────────────────────
