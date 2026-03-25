@@ -1,5 +1,7 @@
 # RUSH Gait Analysis Pipeline
 
+**Paper**: ["Continuous Assessment of Daily-Living Gait Using Self-Supervised Learning of Wrist-Worn Accelerometer Data"](https://www.nature.com/articles/s41746-026-02528-2)
+
 ## File Structure
 
 ```
@@ -114,4 +116,25 @@ numpy scipy pandas torch tqdm pyyaml actipy mat73
 # Optional (10x faster entropy):
 numba
 ```
+## Citation
 
+If you use this code or ElderNet in your research, please cite:
+
+```bibtex
+@article{Brand2026Gait,
+  title={Continuous Assessment of Daily-Living Gait Using Self-Supervised Learning of Wrist-Worn Accelerometer Data},
+  author={Brand, Yonatan E and Buchman, Aron S and Kluge, Felix and Palmerini, Luca and Becker, Clemens and Cereatti, Andrea and Maetzler, Walter and Vereijken, Beatrix and Yarnall, Alison J and Rochester, Lynn and Del Din, Silvia and Mueller, Arne and Hausdorff, Jeffrey M and Perlman, Or},
+  journal={npj Digital Medicine},
+  year={2026},
+  doi={10.1038/s41746-026-02528-2},
+  url={https://www.nature.com/articles/s41746-026-02528-2}
+}
+```
+
+---
+
+## License
+
+University of Oxford Academic Use License. See [LICENSE.md](LICENSE.md) for details.
+
+Based on [ssl-wearables](https://github.com/OxWearables/ssl-wearables) from OxWearables.
