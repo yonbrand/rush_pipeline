@@ -26,3 +26,22 @@ tmpclaude-*
 
 # Claude Code
 .claude/
+
+# Data — large CSVs, Excel files, and pipeline outputs
+output/
+data/
+*.csv
+*.xlsx
+
+# PDFs (generated from Markdown via make_pdf.py)
+*.pdf
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Excel lock files
+~$*

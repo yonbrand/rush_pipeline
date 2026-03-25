@@ -37,12 +37,20 @@ Feature buckets (evaluated independently):
 """
 
 # ── Imports ──────────────────────────────────────────────────────────────────
+import os
 import pandas as pd
 import numpy as np
 import warnings
 from collections import Counter
+from itertools import combinations
+
+# Resolve paths relative to the repository root (one level up from modeling/)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_OUTPUT_DIR = os.path.join(_REPO_ROOT, "output")
 
 warnings.filterwarnings("ignore")
+
+from scipy import stats
 
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.model_selection import (
@@ -76,7 +84,7 @@ except ImportError:
 # Data loading & feature-bucket definitions
 # ═══════════════════════════════════════════════════════════════════════════════
 
-df = pd.read_csv("output/merged_gait_clinical_abl.csv")
+df = pd.read_csv(os.path.join(_OUTPUT_DIR, "merged_gait_clinical_abl.csv"))
 print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
 id_cols = ["sub_id", "projid", "fu_year", "wear_days", "study"]
@@ -373,6 +381,122 @@ def prepare_data(df, feature_cols, outcome_col, demographics=True):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Statistical comparison of feature sets
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def corrected_repeated_cv_test(scores_a, scores_b, n_splits=5, n_repeats=3):
+    """
+    Corrected repeated k-fold CV paired t-test (Nadeau & Bengio, 2003).
+
+    Accounts for the non-independence of CV fold scores, which makes
+    the naive paired t-test anticonservative.
+
+    Parameters
+    ----------
+    scores_a, scores_b : array-like, shape (n_splits * n_repeats,)
+        Per-fold metric scores from repeated CV on the **same folds**.
+    n_splits, n_repeats : int
+        CV configuration (must match how scores were generated).
+
+    Returns
+    -------
+    dict with keys: t_stat, p_value, mean_diff, ci_lower, ci_upper
+    """
+    d = np.asarray(scores_a) - np.asarray(scores_b)
+    n = len(d)
+    d_bar = d.mean()
+    s2_d = d.var(ddof=1)
+
+    # Corrected variance: 1/(k*r) + n_test/n_train = 1/(k*r) + 1/(k-1)
+    correction = 1.0 / n + 1.0 / (n_splits - 1)
+    se = np.sqrt(correction * s2_d)
+
+    if se < 1e-10:
+        return {"t_stat": 0.0, "p_value": 1.0, "mean_diff": d_bar,
+                "ci_lower": d_bar, "ci_upper": d_bar}
+
+    t_stat = d_bar / se
+    df = n - 1
+    p_value = 2.0 * stats.t.sf(abs(t_stat), df)
+
+    t_crit = stats.t.ppf(0.975, df)
+    ci_lower = d_bar - t_crit * se
+    ci_upper = d_bar + t_crit * se
+
+    return {"t_stat": t_stat, "p_value": p_value, "mean_diff": d_bar,
+            "ci_lower": ci_lower, "ci_upper": ci_upper}
+
+
+def compare_feature_sets(all_results, metric, n_splits=5, n_repeats=3):
+    """
+    For each outcome, identify the best (model × selection) per feature set,
+    then run pairwise corrected t-tests on their per-fold scores.
+
+    Parameters
+    ----------
+    all_results : list[dict]
+        Results from run_nested_cv, each dict must contain
+        '_fold_<metric>' with the per-fold scores array.
+    metric : str
+        'R2' or 'AP' — the metric used for comparison.
+
+    Returns
+    -------
+    comparison_rows : list[dict]
+        One row per pairwise comparison.
+    """
+    fold_key = f"_fold_{metric}"
+    mean_key = f"{metric}_mean"
+
+    rows_by_outcome = {}
+    for r in all_results:
+        if r.get(fold_key) is None or np.isnan(r.get(mean_key, np.nan)):
+            continue
+        rows_by_outcome.setdefault(r["Outcome"], []).append(r)
+
+    comparison_rows = []
+    for outcome, rows in rows_by_outcome.items():
+        # Best configuration per feature set
+        best = {}
+        for r in rows:
+            fs = r["Features"]
+            if fs not in best or r[mean_key] > best[fs][mean_key]:
+                best[fs] = r
+
+        feature_sets = sorted(best.keys())
+        for fs_a, fs_b in combinations(feature_sets, 2):
+            res = corrected_repeated_cv_test(
+                best[fs_a][fold_key], best[fs_b][fold_key],
+                n_splits=n_splits, n_repeats=n_repeats,
+            )
+            sig = ""
+            if res["p_value"] < 0.001:
+                sig = "***"
+            elif res["p_value"] < 0.01:
+                sig = "**"
+            elif res["p_value"] < 0.05:
+                sig = "*"
+
+            comparison_rows.append({
+                "Outcome": outcome,
+                "Feature_Set_A": fs_a,
+                "Model_A": f"{best[fs_a]['Model']} [{best[fs_a]['Selection']}]",
+                f"{metric}_A": best[fs_a][mean_key],
+                "Feature_Set_B": fs_b,
+                "Model_B": f"{best[fs_b]['Model']} [{best[fs_b]['Selection']}]",
+                f"{metric}_B": best[fs_b][mean_key],
+                f"Δ{metric}": res["mean_diff"],
+                "CI_lower": res["ci_lower"],
+                "CI_upper": res["ci_upper"],
+                "t_stat": res["t_stat"],
+                "p_value": res["p_value"],
+                "sig": sig,
+            })
+
+    return comparison_rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Nested cross-validation
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -471,6 +595,7 @@ def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
                         "F1_mean": np.nanmean(scores["test_F1"]),
                         "F1_std": np.nanstd(scores["test_F1"]),
                         "prevalence": y.mean(),
+                        "_fold_AP": scores["test_AP"],
                     })
                     print(f"    [{sel_name:14s}] {model_name:22s}  "
                           f"AUC={row['AUC_mean']:.3f}±{row['AUC_std']:.3f}  "
@@ -482,6 +607,7 @@ def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
                         "R2_std": np.nanstd(scores["test_R2"]),
                         "MAE_mean": -np.nanmean(scores["test_MAE"]),
                         "MAE_std": np.nanstd(scores["test_MAE"]),
+                        "_fold_R2": scores["test_R2"],
                     })
                     print(f"    [{sel_name:14s}] {model_name:22s}  "
                           f"R2={row['R2_mean']:.3f}±{row['R2_std']:.3f}  "
@@ -576,11 +702,39 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
                                 selection_strategies=sel)
         all_reg_results.extend(results)
 
+# ── Statistical comparison of feature sets (regression) ──────────────────────
+print("\n" + "=" * 70)
+print("PAIRWISE FEATURE-SET COMPARISON  (corrected repeated CV t-test; Nadeau & Bengio 2003)")
+print("  Compares best model per feature set for each outcome")
+print("=" * 70)
+
+reg_comparisons = compare_feature_sets(all_reg_results, metric="R2",
+                                        n_splits=5, n_repeats=3)
+if reg_comparisons:
+    comp_df = pd.DataFrame(reg_comparisons)
+    for outcome in comp_df["Outcome"].unique():
+        print(f"\n  {outcome}")
+        sub = comp_df[comp_df["Outcome"] == outcome]
+        for _, r in sub.iterrows():
+            print(f"    {r['Feature_Set_A']:30s} vs {r['Feature_Set_B']:30s}  "
+                  f"ΔR²={r['ΔR2']:+.3f}  "
+                  f"95%CI=[{r['CI_lower']:+.3f}, {r['CI_upper']:+.3f}]  "
+                  f"p={r['p_value']:.4f} {r['sig']}")
+    comp_df.to_csv(os.path.join(_OUTPUT_DIR, "feature_set_comparisons_regression.csv"), index=False)
+    print(f"\n  Saved: output/feature_set_comparisons_regression.csv")
+else:
+    print("  No valid comparisons (need ≥2 feature sets with results)")
+
 # ── Save results ─────────────────────────────────────────────────────────────
-clf_df = pd.DataFrame(all_clf_results)
-reg_df = pd.DataFrame(all_reg_results)
-clf_df.to_csv("output/results_classification_nested_cv.csv", index=False)
-reg_df.to_csv("output/results_regression_nested_cv.csv", index=False)
+# Drop internal per-fold score arrays before saving to CSV
+clf_df = pd.DataFrame(all_clf_results).drop(
+    columns=[c for c in pd.DataFrame(all_clf_results).columns if c.startswith("_fold_")],
+    errors="ignore")
+reg_df = pd.DataFrame(all_reg_results).drop(
+    columns=[c for c in pd.DataFrame(all_reg_results).columns if c.startswith("_fold_")],
+    errors="ignore")
+clf_df.to_csv(os.path.join(_OUTPUT_DIR, "results_classification_nested_cv.csv"), index=False)
+reg_df.to_csv(os.path.join(_OUTPUT_DIR, "results_regression_nested_cv.csv"), index=False)
 
 print("\n" + "=" * 70)
 print("RESULTS SAVED")
