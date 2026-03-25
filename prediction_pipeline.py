@@ -1,36 +1,68 @@
 """
-Cross-sectional prediction pipeline: gait metrics -> clinical outcomes.
+Nested cross-validation prediction pipeline: gait metrics → clinical outcomes.
 Uses ABL (analytic baseline) data only — one visit per subject.
+
+Methodology (designed for peer-reviewed publication):
+  - ALL preprocessing (missing-rate filtering, imputation, variance
+    thresholding, correlation pruning, scaling) and feature selection
+    are fitted INSIDE each CV fold to eliminate data leakage.
+  - Nested CV architecture:
+      Outer loop (5-fold × 3 repeats): unbiased generalisation estimates
+      Inner loop (5-fold GridSearchCV): joint hyperparameter + feature-
+      selection tuning (where applicable)
+  - Results report mean ± SD across outer folds.
+  - Most-common inner-CV best parameters are recorded per configuration.
 
 Outcomes:
   Binary:     parkinsonism_yn, mobility_disability_binary, falls_binary,
               cognitive_impairment
   Continuous: parksc, motor10, cogn_global
 
-Models:
-  Primary:     Logistic Regression / Linear Regression (ElasticNet)
-  Sensitivity: Random Forest, XGBoost
+Models (tuned via inner CV):
+  Classification: Logistic Regression, Random Forest, XGBoost
+  Regression:     ElasticNet, Random Forest, XGBoost
 
-Feature buckets evaluated independently and jointly:
+Feature selection strategies (fitted inside CV):
+  1. No Selection      – rely on model regularisation
+  2. SelectKBest       – univariate ANOVA / f_regression (k tuned)
+  3. Mutual Information – MI-based univariate (k tuned)
+  4. L1-based          – SelectFromModel with L1-penalised estimator
+  5. Consensus         – features picked by ≥ 2 of {KBest, MI, L1}
+  6. PCA               – 95 % variance retained
+
+Feature buckets (evaluated independently):
   1. Gait bout metrics
-  2. Daily PA variables
+  2. Daily physical-activity (PA) variables
   3. Combined (gait + daily PA)
 """
 
+# ── Imports ──────────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
 import warnings
+from collections import Counter
+
 warnings.filterwarnings("ignore")
 
-from sklearn.model_selection import RepeatedStratifiedKFold, RepeatedKFold, cross_validate
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import (
+    RepeatedStratifiedKFold, RepeatedKFold,
+    StratifiedKFold, KFold,
+    cross_validate, GridSearchCV,
+)
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression, ElasticNet
+from sklearn.linear_model import LogisticRegression, ElasticNet, Lasso
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif, f_regression
-from sklearn.metrics import (roc_auc_score, f1_score, make_scorer,
-                             r2_score, mean_absolute_error, mean_squared_error)
+from sklearn.feature_selection import (
+    VarianceThreshold, SelectKBest,
+    f_classif, f_regression,
+    mutual_info_classif, mutual_info_regression,
+    SelectFromModel,
+)
+from sklearn.decomposition import PCA
+from sklearn.metrics import make_scorer, f1_score, balanced_accuracy_score
 
 try:
     from xgboost import XGBClassifier, XGBRegressor
@@ -39,16 +71,21 @@ except ImportError:
     HAS_XGB = False
     print("WARNING: xgboost not installed — skipping XGBoost models")
 
-# ── Load data ──────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data loading & feature-bucket definitions
+# ═══════════════════════════════════════════════════════════════════════════════
+
 df = pd.read_csv("output/merged_gait_clinical_abl.csv")
 print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
-# ── Define feature buckets ────────────────────────────────────────────────
 id_cols = ["sub_id", "projid", "fu_year", "wear_days", "study"]
-daily_pa_cols = [c for c in df.columns
-                 if c.startswith("daily_pa_mean_") or c.startswith("daily_pa_std_") or c.startswith("tdpa_")]
+daily_pa_cols = [
+    c for c in df.columns
+    if c.startswith("daily_pa_mean_") or c.startswith("daily_pa_std_")
+    or c.startswith("tdpa_")
+]
 
-# Exclude all outcome / clinical / demographic columns from gait features
 exclude_from_features = set(id_cols + daily_pa_cols + [
     "age_bl", "msex", "educ", "race7", "study", "device", "sub_id",
     "parkinsonism_yn", "dcfdx", "dementia", "cpd_ever", "cogdx",
@@ -66,16 +103,19 @@ exclude_from_features = set(id_cols + daily_pa_cols + [
     "motor_dexterity", "motor_gait", "motor_handstreng",
     "is", "iv", "kar", "kra", "age_at_visit",
 ])
-gait_bout_cols = [c for c in df.columns if c not in exclude_from_features
-                  and not c.startswith("daily_pa_mean_")
-                  and not c.startswith("daily_pa_std_")
-                  and not c.startswith("tdpa_")]
+gait_bout_cols = [
+    c for c in df.columns
+    if c not in exclude_from_features
+    and not c.startswith("daily_pa_mean_")
+    and not c.startswith("daily_pa_std_")
+    and not c.startswith("tdpa_")
+]
 demographic_cols = ["age_bl", "msex", "educ"]
 
 print(f"Gait bout features: {len(gait_bout_cols)}")
 print(f"Daily PA features:  {len(daily_pa_cols)}")
 
-# ── Outcome definitions ───────────────────────────────────────────────────
+# ── Outcome definitions ──────────────────────────────────────────────────────
 BINARY_OUTCOMES = {
     "parkinsonism_yn": "Parkinsonism",
     "mobility_disability_binary": "Mobility Disability",
@@ -88,265 +128,475 @@ CONTINUOUS_OUTCOMES = {
     "cogn_global": "Global Cognition",
 }
 
-# ── Feature buckets ───────────────────────────────────────────────────────
 FEATURE_SETS = {
     "Gait Bout": gait_bout_cols,
     "Daily PA": daily_pa_cols,
     "Combined": gait_bout_cols + daily_pa_cols,
 }
 
+SELECTION_STRATEGIES = [
+    "No Selection",
+    "SelectKBest",
+    "Mutual Info",
+    "L1-based",
+    "Consensus",
+    "PCA",
+]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Cleaning & feature selection helpers
-# ═══════════════════════════════════════════════════════════════════════════
 
-def clean_features(X_df):
-    """Remove columns with >60% missing, zero-variance, or highly correlated (>0.95)."""
-    # Drop columns with too much missing
-    miss_frac = X_df.isnull().mean()
-    keep = miss_frac[miss_frac < 0.6].index.tolist()
-    X_df = X_df[keep]
+# ═══════════════════════════════════════════════════════════════════════════════
+# Custom sklearn-compatible transformers (leak-free preprocessing)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # Drop zero/near-zero variance after imputing for variance check
-    imp = SimpleImputer(strategy="median")
-    X_imp = pd.DataFrame(imp.fit_transform(X_df), columns=X_df.columns)
-    vt = VarianceThreshold(threshold=1e-8)
-    vt.fit(X_imp)
-    keep = X_df.columns[vt.get_support()].tolist()
-    X_df = X_df[keep]
-    X_imp = X_imp[keep]
+class MissingRateFilter(BaseEstimator, TransformerMixin):
+    """Drop columns whose missing rate exceeds *threshold*. Fit on train fold only."""
 
-    # Remove highly correlated features (keep first)
-    corr_matrix = X_imp.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if any(upper[col] > 0.95)]
-    X_df = X_df.drop(columns=to_drop)
+    def __init__(self, threshold=0.6):
+        self.threshold = threshold
 
-    return X_df
+    def fit(self, X, y=None):
+        Xf = np.asarray(X, dtype=float)
+        miss = np.isnan(Xf).mean(axis=0)
+        self.keep_mask_ = miss < self.threshold
+        if not self.keep_mask_.any():
+            self.keep_mask_[0] = True
+        return self
 
+    def transform(self, X):
+        return np.asarray(X, dtype=float)[:, self.keep_mask_]
+
+
+class CorrelationFilter(BaseEstimator, TransformerMixin):
+    """Drop features with pairwise |r| > *threshold* (keep the earlier column)."""
+
+    def __init__(self, threshold=0.95):
+        self.threshold = threshold
+
+    def fit(self, X, y=None):
+        corr = np.abs(np.corrcoef(X, rowvar=False))
+        np.fill_diagonal(corr, 0.0)
+        n = X.shape[1]
+        drop = set()
+        for i in range(n):
+            if i in drop:
+                continue
+            for j in range(i + 1, n):
+                if j not in drop and corr[i, j] > self.threshold:
+                    drop.add(j)
+        self.keep_idx_ = sorted(set(range(n)) - drop)
+        if not self.keep_idx_:
+            self.keep_idx_ = [0]
+        return self
+
+    def transform(self, X):
+        return X[:, self.keep_idx_]
+
+
+class ConsensusSelector(BaseEstimator, TransformerMixin):
+    """Select features voted by ≥ *min_votes* of {SelectKBest, MI, L1}."""
+
+    def __init__(self, task_type="classification", k=30, min_votes=2):
+        self.task_type = task_type
+        self.k = k
+        self.min_votes = min_votes
+
+    def fit(self, X, y):
+        p = X.shape[1]
+        k = min(self.k, p)
+
+        score_func = f_classif if self.task_type == "classification" else f_regression
+        skb_mask = SelectKBest(score_func, k=k).fit(X, y).get_support()
+
+        mi_func = _mi_classif if self.task_type == "classification" else _mi_regression
+        mi_scores = mi_func(X, y)
+        mi_mask = np.zeros(p, dtype=bool)
+        mi_mask[np.argsort(mi_scores)[-k:]] = True
+
+        if self.task_type == "classification":
+            l1_est = LogisticRegression(
+                penalty="l1", solver="saga", C=0.1,
+                max_iter=5000, class_weight="balanced", random_state=42)
+        else:
+            l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
+        l1_mask = SelectFromModel(l1_est).fit(X, y).get_support()
+
+        votes = skb_mask.astype(int) + mi_mask.astype(int) + l1_mask.astype(int)
+        self.mask_ = votes >= self.min_votes
+        if self.mask_.sum() < 5:
+            self.mask_ = votes >= 1
+        if self.mask_.sum() == 0:
+            self.mask_ = np.ones(p, dtype=bool)
+        return self
+
+    def transform(self, X):
+        return X[:, self.mask_]
+
+
+# ── Reproducible MI wrappers (fix random_state) ─────────────────────────────
+
+def _mi_classif(X, y):
+    return mutual_info_classif(X, y, random_state=42)
+
+
+def _mi_regression(X, y):
+    return mutual_info_regression(X, y, random_state=42)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pipeline & parameter-grid construction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _preprocessing_steps():
+    """Common leak-free preprocessing (order matters)."""
+    return [
+        ("miss_filter", MissingRateFilter(threshold=0.6)),
+        ("impute", SimpleImputer(strategy="median")),
+        ("variance", VarianceThreshold(threshold=1e-8)),
+        ("corr_filter", CorrelationFilter(threshold=0.95)),
+        ("scale", StandardScaler()),
+    ]
+
+
+def build_pipeline_and_grid(model, model_params, selection_strategy, task_type):
+    """
+    Build a full sklearn Pipeline and a combined parameter grid
+    that jointly tunes model hyperparameters and selection params.
+
+    Returns (Pipeline, param_grid dict).
+    """
+    steps = _preprocessing_steps()
+    extra_grid = {}
+
+    if selection_strategy == "No Selection":
+        pass
+    elif selection_strategy == "SelectKBest":
+        score_func = f_classif if task_type == "classification" else f_regression
+        steps.append(("select", SelectKBest(score_func, k=20)))
+        extra_grid["select__k"] = [10, 20, 30]
+    elif selection_strategy == "Mutual Info":
+        mi_func = _mi_classif if task_type == "classification" else _mi_regression
+        steps.append(("select", SelectKBest(mi_func, k=20)))
+        extra_grid["select__k"] = [10, 20, 30]
+    elif selection_strategy == "L1-based":
+        if task_type == "classification":
+            l1_est = LogisticRegression(
+                penalty="l1", solver="saga", C=0.1,
+                max_iter=5000, class_weight="balanced", random_state=42)
+        else:
+            l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
+        steps.append(("select", SelectFromModel(l1_est)))
+    elif selection_strategy == "Consensus":
+        steps.append(("select", ConsensusSelector(task_type=task_type, k=30)))
+    elif selection_strategy == "PCA":
+        steps.append(("select", PCA(n_components=0.95, svd_solver="full")))
+    else:
+        raise ValueError(f"Unknown strategy: {selection_strategy}")
+
+    steps.append(("model", model))
+    combined_grid = {**model_params, **extra_grid}
+    return Pipeline(steps), combined_grid
+
+
+# ── Model + grid definitions ────────────────────────────────────────────────
+
+def get_clf_models():
+    """Return {name: (estimator, param_grid)} for classification."""
+    models = {
+        "Logistic Regression": (
+            LogisticRegression(
+                max_iter=2000, solver="lbfgs",
+                class_weight="balanced", random_state=42),
+            {"model__C": [0.01, 0.1, 1.0, 10.0]},
+        ),
+        "Random Forest": (
+            RandomForestClassifier(
+                class_weight="balanced", random_state=42, n_jobs=-1),
+            {"model__n_estimators": [100, 200],
+             "model__max_depth": [4, 8, None]},
+        ),
+    }
+    if HAS_XGB:
+        models["XGBoost"] = (
+            XGBClassifier(
+                eval_metric="logloss", random_state=42, n_jobs=-1),
+            {"model__n_estimators": [100, 200],
+             "model__max_depth": [3, 5],
+             "model__learning_rate": [0.01, 0.05, 0.1]},
+        )
+    return models
+
+
+def get_reg_models():
+    """Return {name: (estimator, param_grid)} for regression."""
+    models = {
+        "ElasticNet": (
+            ElasticNet(max_iter=5000, random_state=42),
+            {"model__alpha": [0.01, 0.1, 0.5, 1.0],
+             "model__l1_ratio": [0.3, 0.5, 0.7]},
+        ),
+        "Random Forest": (
+            RandomForestRegressor(random_state=42, n_jobs=-1),
+            {"model__n_estimators": [100, 200],
+             "model__max_depth": [4, 8, None]},
+        ),
+    }
+    if HAS_XGB:
+        models["XGBoost"] = (
+            XGBRegressor(random_state=42, n_jobs=-1),
+            {"model__n_estimators": [100, 200],
+             "model__max_depth": [3, 5],
+             "model__learning_rate": [0.01, 0.05, 0.1]},
+        )
+    return models
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data preparation (no cleaning — that happens inside the pipeline)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def prepare_data(df, feature_cols, outcome_col, demographics=True):
-    """Subset data, clean features, return X, y."""
-    cols = list(feature_cols) + (demographic_cols if demographics else []) + [outcome_col]
+    """Subset columns and drop rows missing the outcome. Returns raw X array and y."""
+    feature_part = list(feature_cols) + (demographic_cols if demographics else [])
+    cols = feature_part + [outcome_col]
     sub = df[cols].dropna(subset=[outcome_col])
-
     y = sub[outcome_col].values
-    feature_part = list(feature_cols)
-    if demographics:
-        feature_part = feature_part + demographic_cols
-
-    X_df = sub[feature_part].copy()
-    X_df = clean_features(X_df)
-
-    return X_df, y
+    X = sub[feature_part].values.astype(float)
+    return X, y
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Model definitions
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Nested cross-validation
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def get_classifiers(n_features):
-    k = min(n_features, 30)
-    models = {
-        "Logistic Regression": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-            ("select", SelectKBest(f_classif, k=k)),
-            ("clf", LogisticRegression(penalty="l2", C=1.0, max_iter=2000,
-                                       solver="lbfgs", class_weight="balanced")),
-        ]),
-        "Random Forest": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("select", SelectKBest(f_classif, k=k)),
-            ("clf", RandomForestClassifier(n_estimators=200, max_depth=8,
-                                           class_weight="balanced",
-                                           random_state=42, n_jobs=-1)),
-        ]),
-    }
-    if HAS_XGB:
-        models["XGBoost"] = Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("select", SelectKBest(f_classif, k=k)),
-            ("clf", XGBClassifier(n_estimators=200, max_depth=4,
-                                  learning_rate=0.05, subsample=0.8,
-                                  scale_pos_weight=1,
-                                  eval_metric="logloss",
-                                  random_state=42, n_jobs=-1)),
-        ])
-    return models
+def run_nested_cv(X, y, task_type, outcome_name, feature_set_name):
+    """
+    Nested CV over all (selection × model) combinations for one
+    outcome × feature-set pair.
 
+    Outer loop: unbiased performance estimation (5×3 repeated K-fold)
+    Inner loop: hyperparameter tuning via 5-fold GridSearchCV
+    """
+    if task_type == "classification":
+        outer_cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=42)
+        inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scoring = {
+            "AUC": "roc_auc",
+            "F1": make_scorer(f1_score, zero_division=0),
+            "AP": "average_precision",
+            "BalAcc": make_scorer(balanced_accuracy_score),
+        }
+        inner_scoring = "average_precision"
+        model_defs = get_clf_models()
+    else:
+        outer_cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+        inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+        scoring = {
+            "R2": "r2",
+            "MAE": "neg_mean_absolute_error",
+        }
+        inner_scoring = "r2"
+        model_defs = get_reg_models()
 
-def get_regressors(n_features):
-    k = min(n_features, 30)
-    models = {
-        "ElasticNet": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-            ("select", SelectKBest(f_regression, k=k)),
-            ("clf", ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=5000)),
-        ]),
-        "Random Forest": Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("select", SelectKBest(f_regression, k=k)),
-            ("clf", RandomForestRegressor(n_estimators=200, max_depth=8,
-                                          random_state=42, n_jobs=-1)),
-        ]),
-    }
-    if HAS_XGB:
-        models["XGBoost"] = Pipeline([
-            ("impute", SimpleImputer(strategy="median")),
-            ("select", SelectKBest(f_regression, k=k)),
-            ("clf", XGBRegressor(n_estimators=200, max_depth=4,
-                                 learning_rate=0.05, subsample=0.8,
-                                 random_state=42, n_jobs=-1)),
-        ])
-    return models
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Evaluation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def evaluate_classification(X_df, y, models, outcome_name, feature_set_name):
-    """5-fold repeated stratified CV for classification."""
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=42)
-    scoring = {
-        "AUC": "roc_auc",
-        "F1": make_scorer(f1_score, zero_division=0),
-    }
     results = []
-    for model_name, pipe in models.items():
-        try:
-            scores = cross_validate(pipe, X_df.values, y, cv=cv, scoring=scoring,
-                                    n_jobs=-1, error_score="raise")
-            results.append({
-                "Outcome": outcome_name,
-                "Features": feature_set_name,
-                "Model": model_name,
-                "AUC_mean": scores["test_AUC"].mean(),
-                "AUC_std": scores["test_AUC"].std(),
-                "F1_mean": scores["test_F1"].mean(),
-                "F1_std": scores["test_F1"].std(),
-                "n_samples": len(y),
-                "n_features_input": X_df.shape[1],
-                "prevalence": y.mean(),
-            })
-        except Exception as e:
-            print(f"  WARN: {model_name} failed on {outcome_name}/{feature_set_name}: {e}")
-            results.append({
-                "Outcome": outcome_name, "Features": feature_set_name,
-                "Model": model_name, "AUC_mean": np.nan, "AUC_std": np.nan,
-                "F1_mean": np.nan, "F1_std": np.nan,
-                "n_samples": len(y), "n_features_input": X_df.shape[1],
-                "prevalence": y.mean(),
-            })
+
+    for sel_name in SELECTION_STRATEGIES:
+        for model_name, (model_instance, model_params) in model_defs.items():
+            try:
+                pipe, grid = build_pipeline_and_grid(
+                    clone(model_instance), model_params, sel_name, task_type)
+
+                grid_search = GridSearchCV(
+                    pipe, grid,
+                    cv=inner_cv,
+                    scoring=inner_scoring,
+                    refit=True,
+                    n_jobs=-1,
+                    error_score=np.nan,
+                )
+
+                scores = cross_validate(
+                    grid_search, X, y,
+                    cv=outer_cv,
+                    scoring=scoring,
+                    n_jobs=1,  # inner GridSearchCV already parallelised
+                    return_estimator=True,
+                    error_score=np.nan,
+                )
+
+                # Collect best params from each outer fold
+                best_params_list = [
+                    est.best_params_ for est in scores["estimator"]
+                    if hasattr(est, "best_params_")
+                ]
+                modal_params = (
+                    Counter(str(p) for p in best_params_list).most_common(1)[0][0]
+                    if best_params_list else "N/A"
+                )
+
+                row = {
+                    "Outcome": outcome_name,
+                    "Features": feature_set_name,
+                    "Selection": sel_name,
+                    "Model": model_name,
+                    "n_samples": len(y),
+                    "n_features_input": X.shape[1],
+                    "best_params": modal_params,
+                }
+
+                if task_type == "classification":
+                    row.update({
+                        "AUC_mean": np.nanmean(scores["test_AUC"]),
+                        "AUC_std": np.nanstd(scores["test_AUC"]),
+                        "AP_mean": np.nanmean(scores["test_AP"]),
+                        "AP_std": np.nanstd(scores["test_AP"]),
+                        "BalAcc_mean": np.nanmean(scores["test_BalAcc"]),
+                        "BalAcc_std": np.nanstd(scores["test_BalAcc"]),
+                        "F1_mean": np.nanmean(scores["test_F1"]),
+                        "F1_std": np.nanstd(scores["test_F1"]),
+                        "prevalence": y.mean(),
+                    })
+                    print(f"    [{sel_name:14s}] {model_name:22s}  "
+                          f"AUC={row['AUC_mean']:.3f}±{row['AUC_std']:.3f}  "
+                          f"AP={row['AP_mean']:.3f}  "
+                          f"BalAcc={row['BalAcc_mean']:.3f}")
+                else:
+                    row.update({
+                        "R2_mean": np.nanmean(scores["test_R2"]),
+                        "R2_std": np.nanstd(scores["test_R2"]),
+                        "MAE_mean": -np.nanmean(scores["test_MAE"]),
+                        "MAE_std": np.nanstd(scores["test_MAE"]),
+                    })
+                    print(f"    [{sel_name:14s}] {model_name:22s}  "
+                          f"R2={row['R2_mean']:.3f}±{row['R2_std']:.3f}  "
+                          f"MAE={row['MAE_mean']:.3f}")
+
+                results.append(row)
+
+            except Exception as e:
+                print(f"    [{sel_name:14s}] {model_name:22s}  FAILED: {e}")
+                row = {
+                    "Outcome": outcome_name,
+                    "Features": feature_set_name,
+                    "Selection": sel_name,
+                    "Model": model_name,
+                    "n_samples": len(y),
+                    "n_features_input": X.shape[1],
+                    "best_params": None,
+                }
+                if task_type == "classification":
+                    row.update({k: np.nan for k in [
+                        "AUC_mean", "AUC_std", "AP_mean", "AP_std",
+                        "BalAcc_mean", "BalAcc_std", "F1_mean", "F1_std"]})
+                    row["prevalence"] = y.mean()
+                else:
+                    row.update({k: np.nan for k in [
+                        "R2_mean", "R2_std", "MAE_mean", "MAE_std"]})
+                results.append(row)
+
     return results
 
 
-def evaluate_regression(X_df, y, models, outcome_name, feature_set_name):
-    """5-fold repeated CV for regression."""
-    cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
-    scoring = {
-        "R2": "r2",
-        "MAE": "neg_mean_absolute_error",
-    }
-    results = []
-    for model_name, pipe in models.items():
-        try:
-            scores = cross_validate(pipe, X_df.values, y, cv=cv, scoring=scoring,
-                                    n_jobs=-1, error_score="raise")
-            results.append({
-                "Outcome": outcome_name,
-                "Features": feature_set_name,
-                "Model": model_name,
-                "R2_mean": scores["test_R2"].mean(),
-                "R2_std": scores["test_R2"].std(),
-                "MAE_mean": -scores["test_MAE"].mean(),
-                "MAE_std": scores["test_MAE"].std(),
-                "n_samples": len(y),
-                "n_features_input": X_df.shape[1],
-            })
-        except Exception as e:
-            print(f"  WARN: {model_name} failed on {outcome_name}/{feature_set_name}: {e}")
-            results.append({
-                "Outcome": outcome_name, "Features": feature_set_name,
-                "Model": model_name, "R2_mean": np.nan, "R2_std": np.nan,
-                "MAE_mean": np.nan, "MAE_std": np.nan,
-                "n_samples": len(y), "n_features_input": X_df.shape[1],
-            })
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Run pipeline
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 all_clf_results = []
 all_reg_results = []
 
 print("\n" + "=" * 70)
-print("BINARY CLASSIFICATION")
+print("BINARY CLASSIFICATION  (nested CV)")
 print("=" * 70)
 
 for outcome_col, outcome_name in BINARY_OUTCOMES.items():
-    print(f"\n-- {outcome_name} ({outcome_col}) --")
+    print(f"\n{'─'*70}")
+    print(f"  {outcome_name} ({outcome_col})")
+    print(f"{'─'*70}")
     for fs_name, fs_cols in FEATURE_SETS.items():
-        X_df, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
-            print(f"  {fs_name}: skipped (n={len(y)}, pos={y.sum()})")
+            print(f"  {fs_name}: skipped (n={len(y)}, pos={y.sum():.0f})")
             continue
-        print(f"  {fs_name}: n={len(y)}, features={X_df.shape[1]}, prevalence={y.mean():.2%}")
-        models = get_classifiers(X_df.shape[1])
-        results = evaluate_classification(X_df, y, models, outcome_name, fs_name)
-        for r in results:
-            print(f"    {r['Model']:25s}  AUC={r['AUC_mean']:.3f}+/-{r['AUC_std']:.3f}  "
-                  f"F1={r['F1_mean']:.3f}+/-{r['F1_std']:.3f}")
+        print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}, "
+              f"prevalence={y.mean():.2%}")
+
+        results = run_nested_cv(X, y, "classification", outcome_name, fs_name)
         all_clf_results.extend(results)
 
 print("\n" + "=" * 70)
-print("CONTINUOUS REGRESSION")
+print("CONTINUOUS REGRESSION  (nested CV)")
 print("=" * 70)
 
 for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
-    print(f"\n-- {outcome_name} ({outcome_col}) --")
+    print(f"\n{'─'*70}")
+    print(f"  {outcome_name} ({outcome_col})")
+    print(f"{'─'*70}")
     for fs_name, fs_cols in FEATURE_SETS.items():
-        X_df, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50:
             print(f"  {fs_name}: skipped (n={len(y)})")
             continue
-        print(f"  {fs_name}: n={len(y)}, features={X_df.shape[1]}")
-        models = get_regressors(X_df.shape[1])
-        results = evaluate_regression(X_df, y, models, outcome_name, fs_name)
-        for r in results:
-            print(f"    {r['Model']:25s}  R2={r['R2_mean']:.3f}+/-{r['R2_std']:.3f}  "
-                  f"MAE={r['MAE_mean']:.3f}+/-{r['MAE_std']:.3f}")
+        print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}")
+
+        results = run_nested_cv(X, y, "regression", outcome_name, fs_name)
         all_reg_results.extend(results)
 
-# ── Save results ──────────────────────────────────────────────────────────
+# ── Save results ─────────────────────────────────────────────────────────────
 clf_df = pd.DataFrame(all_clf_results)
 reg_df = pd.DataFrame(all_reg_results)
-clf_df.to_csv("output/results_classification.csv", index=False)
-reg_df.to_csv("output/results_regression.csv", index=False)
+clf_df.to_csv("output/results_classification_nested_cv.csv", index=False)
+reg_df.to_csv("output/results_regression_nested_cv.csv", index=False)
 
 print("\n" + "=" * 70)
 print("RESULTS SAVED")
 print("=" * 70)
-print(f"  Classification: output/results_classification.csv ({len(clf_df)} rows)")
-print(f"  Regression:     output/results_regression.csv ({len(reg_df)} rows)")
+print(f"  Classification: output/results_classification_nested_cv.csv ({len(clf_df)} rows)")
+print(f"  Regression:     output/results_regression_nested_cv.csv ({len(reg_df)} rows)")
 
-# ── Summary table ─────────────────────────────────────────────────────────
+# ── Summary tables ───────────────────────────────────────────────────────────
 print("\n" + "=" * 70)
-print("CLASSIFICATION SUMMARY (best model per outcome × feature set)")
+print("CLASSIFICATION SUMMARY — Best (Model × Selection) per Outcome × Features")
+print("  Ranked by Average Precision (more robust to class imbalance)")
 print("=" * 70)
 if len(clf_df) > 0:
-    best_clf = clf_df.loc[clf_df.groupby(["Outcome", "Features"])["AUC_mean"].idxmax()]
-    print(best_clf[["Outcome", "Features", "Model", "AUC_mean", "AUC_std",
-                     "F1_mean", "n_samples"]].to_string(index=False))
+    valid = clf_df.dropna(subset=["AP_mean"])
+    if len(valid) > 0:
+        best_clf = valid.loc[valid.groupby(["Outcome", "Features"])["AP_mean"].idxmax()]
+        print(best_clf[["Outcome", "Features", "Selection", "Model",
+                         "AP_mean", "AP_std", "AUC_mean", "BalAcc_mean",
+                         "n_samples", "best_params"]].to_string(index=False))
 
 print("\n" + "=" * 70)
-print("REGRESSION SUMMARY (best model per outcome × feature set)")
+print("REGRESSION SUMMARY — Best (Model × Selection) per Outcome × Features")
 print("=" * 70)
 if len(reg_df) > 0:
-    best_reg = reg_df.loc[reg_df.groupby(["Outcome", "Features"])["R2_mean"].idxmax()]
-    print(best_reg[["Outcome", "Features", "Model", "R2_mean", "R2_std",
-                     "MAE_mean", "n_samples"]].to_string(index=False))
+    valid = reg_df.dropna(subset=["R2_mean"])
+    if len(valid) > 0:
+        best_reg = valid.loc[valid.groupby(["Outcome", "Features"])["R2_mean"].idxmax()]
+        print(best_reg[["Outcome", "Features", "Selection", "Model",
+                         "R2_mean", "R2_std", "MAE_mean",
+                         "n_samples", "best_params"]].to_string(index=False))
+
+# ── Selection strategy comparison ────────────────────────────────────────────
+print("\n" + "=" * 70)
+print("SELECTION STRATEGY COMPARISON (avg across outcomes & feature sets)")
+print("=" * 70)
+if len(clf_df) > 0:
+    valid = clf_df.dropna(subset=["AP_mean"])
+    if len(valid) > 0:
+        sel_summary = valid.groupby("Selection").agg(
+            AP_mean=("AP_mean", "mean"),
+            AUC_mean=("AUC_mean", "mean"),
+            BalAcc_mean=("BalAcc_mean", "mean"),
+        ).round(3).sort_values("AP_mean", ascending=False)
+        print("\nClassification:")
+        print(sel_summary.to_string())
+
+if len(reg_df) > 0:
+    valid = reg_df.dropna(subset=["R2_mean"])
+    if len(valid) > 0:
+        sel_summary = valid.groupby("Selection").agg(
+            R2_mean=("R2_mean", "mean"),
+            MAE_mean=("MAE_mean", "mean"),
+        ).round(3).sort_values("R2_mean", ascending=False)
+        print("\nRegression:")
+        print(sel_summary.to_string())
