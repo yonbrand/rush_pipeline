@@ -34,6 +34,8 @@ Feature buckets (evaluated independently):
   1. Gait bout metrics
   2. Daily physical-activity (PA) variables
   3. Combined (gait + daily PA)
+  4. 8-ft gait speed (clinical baseline)
+  5. Combined + 8-ft speed (augmented)
 """
 
 # ── Imports ──────────────────────────────────────────────────────────────────
@@ -142,10 +144,10 @@ FEATURE_SETS = {
     "Combined": gait_bout_cols + daily_pa_cols,
 }
 
-# Regression-only feature sets: clinical gait speed baseline & augmented combined
+# Clinical gait-speed baseline & augmented combined — used for BOTH tasks.
 # NOTE: gait_speed (8-foot walk test) may partially overlap with parksc/motor10
 #       scoring — interpret those outcomes with caution (see limitations).
-REGRESSION_EXTRA_FEATURE_SETS = {
+EXTRA_FEATURE_SETS = {
     "8ft Gait Speed (baseline)": ["gait_speed"],
     "Combined + 8ft Speed": gait_bout_cols + daily_pa_cols + ["gait_speed"],
 }
@@ -654,6 +656,8 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
     print(f"\n{'─'*70}")
     print(f"  {outcome_name} ({outcome_col})")
     print(f"{'─'*70}")
+
+    # Sensor-based feature sets (full selection strategy sweep)
     for fs_name, fs_cols in FEATURE_SETS.items():
         X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
@@ -663,6 +667,24 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
               f"prevalence={y.mean():.2%}")
 
         results = run_nested_cv(X, y, "classification", outcome_name, fs_name)
+        all_clf_results.extend(results)
+
+    # Clinical baseline & augmented feature sets
+    for fs_name, fs_cols in EXTRA_FEATURE_SETS.items():
+        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        if len(y) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
+            print(f"  {fs_name}: skipped (n={len(y)}, pos={y.sum():.0f})")
+            continue
+        # For the baseline (few features), only "No Selection" is meaningful;
+        # for the augmented combined set, run the full sweep.
+        is_baseline = (len(fs_cols) <= 3)
+        sel = ["No Selection"] if is_baseline else None
+        print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}, "
+              f"prevalence={y.mean():.2%}"
+              + (" [baseline — No Selection only]" if is_baseline else ""))
+
+        results = run_nested_cv(X, y, "classification", outcome_name, fs_name,
+                                selection_strategies=sel)
         all_clf_results.extend(results)
 
 print("\n" + "=" * 70)
@@ -686,7 +708,7 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
         all_reg_results.extend(results)
 
     # Clinical baseline & augmented feature sets
-    for fs_name, fs_cols in REGRESSION_EXTRA_FEATURE_SETS.items():
+    for fs_name, fs_cols in EXTRA_FEATURE_SETS.items():
         X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50:
             print(f"  {fs_name}: skipped (n={len(y)})")
@@ -702,25 +724,47 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
                                 selection_strategies=sel)
         all_reg_results.extend(results)
 
-# ── Statistical comparison of feature sets (regression) ──────────────────────
+# ── Statistical comparison of feature sets ───────────────────────────────────
 print("\n" + "=" * 70)
-print("PAIRWISE FEATURE-SET COMPARISON  (corrected repeated CV t-test; Nadeau & Bengio 2003)")
-print("  Compares best model per feature set for each outcome")
+print("PAIRWISE FEATURE-SET COMPARISON — CLASSIFICATION  (corrected repeated CV t-test)")
+print("  Compares best model per feature set for each outcome (metric: AP)")
+print("=" * 70)
+
+clf_comparisons = compare_feature_sets(all_clf_results, metric="AP",
+                                        n_splits=5, n_repeats=3)
+if clf_comparisons:
+    comp_clf_df = pd.DataFrame(clf_comparisons)
+    for outcome in comp_clf_df["Outcome"].unique():
+        print(f"\n  {outcome}")
+        sub = comp_clf_df[comp_clf_df["Outcome"] == outcome]
+        for _, r in sub.iterrows():
+            print(f"    {r['Feature_Set_A']:30s} vs {r['Feature_Set_B']:30s}  "
+                  f"ΔAP={r['ΔAP']:+.3f}  "
+                  f"95%CI=[{r['CI_lower']:+.3f}, {r['CI_upper']:+.3f}]  "
+                  f"p={r['p_value']:.4f} {r['sig']}")
+    comp_clf_df.to_csv(os.path.join(_OUTPUT_DIR, "feature_set_comparisons_classification.csv"), index=False)
+    print(f"\n  Saved: output/feature_set_comparisons_classification.csv")
+else:
+    print("  No valid comparisons (need ≥2 feature sets with results)")
+
+print("\n" + "=" * 70)
+print("PAIRWISE FEATURE-SET COMPARISON — REGRESSION  (corrected repeated CV t-test)")
+print("  Compares best model per feature set for each outcome (metric: R²)")
 print("=" * 70)
 
 reg_comparisons = compare_feature_sets(all_reg_results, metric="R2",
                                         n_splits=5, n_repeats=3)
 if reg_comparisons:
-    comp_df = pd.DataFrame(reg_comparisons)
-    for outcome in comp_df["Outcome"].unique():
+    comp_reg_df = pd.DataFrame(reg_comparisons)
+    for outcome in comp_reg_df["Outcome"].unique():
         print(f"\n  {outcome}")
-        sub = comp_df[comp_df["Outcome"] == outcome]
+        sub = comp_reg_df[comp_reg_df["Outcome"] == outcome]
         for _, r in sub.iterrows():
             print(f"    {r['Feature_Set_A']:30s} vs {r['Feature_Set_B']:30s}  "
                   f"ΔR²={r['ΔR2']:+.3f}  "
                   f"95%CI=[{r['CI_lower']:+.3f}, {r['CI_upper']:+.3f}]  "
                   f"p={r['p_value']:.4f} {r['sig']}")
-    comp_df.to_csv(os.path.join(_OUTPUT_DIR, "feature_set_comparisons_regression.csv"), index=False)
+    comp_reg_df.to_csv(os.path.join(_OUTPUT_DIR, "feature_set_comparisons_regression.csv"), index=False)
     print(f"\n  Saved: output/feature_set_comparisons_regression.csv")
 else:
     print("  No valid comparisons (need ≥2 feature sets with results)")
