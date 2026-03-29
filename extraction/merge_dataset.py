@@ -1,186 +1,166 @@
 """
-Merge gait metrics (subject_summary.csv) with clinical/demographic data
-from wrist_sensor_metadata_Yonatan.xlsx.
-
-Outputs (controlled by flags below):
-  - output/merged_gait_clinical_abl.csv   (ABL only — one visit per subject)
-  - output/merged_gait_clinical_lv.csv    (LV only — last visit per subject)
-  - output/merged_gait_clinical_allvisits.csv  (all valid visits)
-  - output/merged_gait_clinical_postmortem.csv (ABL + postmortem indices)
+Refactored Merge Script for RUSH Gait + Clinical Data
+----------------------------------------------------
+- Robust path handling
+- Automatic directory creation
+- Cleaner structure
+- Reusable functions
+- Easier to maintain / extend
 """
 
+import os
 import pandas as pd
 import numpy as np
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FLAGS — toggle which datasets to produce
+# CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-EXPORT_ABL = True           # Analytic baseline (first visit) — for cross-sectional
-EXPORT_LV = True            # Last visit — for future analyses
-EXPORT_ALL_VISITS = True    # All valid visits — for longitudinal / mixed models
-EXPORT_POSTMORTEM = True    # ABL + postmortem pathology indices
+BASE_DIR = "N:/Gait-Neurodynamics by Names/Yonatan/RUSH/rush_pipeline"
+INPUT_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_DIR = os.path.join(INPUT_DIR, "tables")
 
-# ── Load data ──────────────────────────────────────────────────────────────
-gait = pd.read_csv("output/subject_summary.csv")
-excel = "output/wrist_sensor_metadata_Yonatan.xlsx"
-abl = pd.read_excel(excel, sheet_name="ABL")
-lv = pd.read_excel(excel, sheet_name="LV")
-allv = pd.read_excel(excel, sheet_name="Data from all valid cycles")
-postmortem = pd.read_excel(excel, sheet_name="Postmortem Indices")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-print(f"Gait data: {gait.shape[0]} rows, {gait.shape[1]} columns")
+FILES = {
+    "gait": os.path.join(INPUT_DIR, "subject_summary.csv"),
+    "excel": os.path.join(INPUT_DIR, "wrist_sensor_metadata_Yonatan.xlsx"),
+}
 
+EXPORT_FLAGS = {
+    "ABL": True,
+    "LV": True,
+    "ALL_VISITS": True,
+    "POSTMORTEM": True,
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Helper: derive binary outcomes + add feature bucket info
+# LOAD DATA
 # ═══════════════════════════════════════════════════════════════════════════
 
-def derive_binary_outcomes(merged):
-    """Create binary columns from multi-class outcomes."""
-    # Mobility disability: rosbsum > 0
-    merged["mobility_disability_binary"] = (merged["rosbsum"] > 0).astype(float)
-    merged.loc[merged["rosbsum"].isna(), "mobility_disability_binary"] = np.nan
+def load_data():
+    gait = pd.read_csv(FILES["gait"])
+    excel = FILES["excel"]
 
-    # Falls binary: falls > 0 (from full 'falls' variable if present)
-    if "falls" in merged.columns:
-        merged["falls_binary"] = (merged["falls"] > 0).astype(float)
-        merged.loc[merged["falls"].isna(), "falls_binary"] = np.nan
-    elif "falls_binary" not in merged.columns:
-        merged["falls_binary"] = np.nan
-
-    # Cognitive impairment: dcfdx == 1 -> NCI (0), dcfdx > 1 -> impaired (1)
-    if "dcfdx" in merged.columns:
-        merged["cognitive_impairment"] = (merged["dcfdx"] > 1).astype(float)
-        merged.loc[merged["dcfdx"].isna(), "cognitive_impairment"] = np.nan
-    elif "dcfdx_3gp" in merged.columns:
-        merged["cognitive_impairment"] = (merged["dcfdx_3gp"] > 1).astype(float)
-        merged.loc[merged["dcfdx_3gp"].isna(), "cognitive_impairment"] = np.nan
-    else:
-        merged["cognitive_impairment"] = np.nan
-
-    # Age at visit
-    if "age_bl" in merged.columns:
-        merged["age_at_visit"] = merged["age_bl"] + merged["fu_year"]
-
-    return merged
-
-
-def print_outcome_summary(merged, label):
-    """Print outcome availability for a merged dataset."""
-    outcomes = {
-        "parkinsonism_yn": "binary",
-        "mobility_disability_binary": "binary",
-        "falls_binary": "binary",
-        "cognitive_impairment": "binary",
-        "parksc": "continuous",
-        "motor10": "continuous",
-        "cogn_global": "continuous",
+    sheets = {
+        "abl": pd.read_excel(excel, sheet_name="ABL"),
+        "lv": pd.read_excel(excel, sheet_name="LV"),
+        "allv": pd.read_excel(excel, sheet_name="Data from all valid cycles"),
+        "postmortem": pd.read_excel(excel, sheet_name="Postmortem Indices"),
     }
-    print(f"\n  Outcome availability ({label}):")
-    for col, dtype in outcomes.items():
-        if col not in merged.columns:
-            print(f"    {col:35s}  NOT AVAILABLE")
-            continue
-        n = merged[col].notna().sum()
-        if dtype == "binary" and n > 0:
-            pos = (merged[col] == 1).sum()
-            print(f"    {col:35s}  n={n:5d}  pos={pos:4d}  ({100*pos/n:.1f}%)")
-        elif dtype == "continuous" and n > 0:
-            print(f"    {col:35s}  n={n:5d}  mean={merged[col].mean():.3f}  std={merged[col].std():.3f}")
-        else:
-            print(f"    {col:35s}  n=0")
 
+    print(f"Gait data: {gait.shape}")
+    return gait, sheets
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. ABL — Analytic Baseline (one visit per subject, full clinical)
+# FEATURE ENGINEERING
 # ═══════════════════════════════════════════════════════════════════════════
-if EXPORT_ABL:
-    merged_abl = gait.merge(abl, on=["projid", "fu_year"], how="inner")
-    merged_abl = derive_binary_outcomes(merged_abl)
 
-    print(f"\n[ABL] Merged: {merged_abl.shape[0]} rows, {merged_abl.shape[1]} cols")
-    print(f"  Unique subjects: {merged_abl['projid'].nunique()}")
-    print_outcome_summary(merged_abl, "ABL")
+def derive_binary_outcomes(df):
+    df = df.copy()
 
-    merged_abl.to_csv("output/merged_gait_clinical_abl.csv", index=False)
-    print(f"  -> Saved: output/merged_gait_clinical_abl.csv")
+    df["mobility_disability_binary"] = (df["rosbsum"] > 0).astype(float)
+    df.loc[df["rosbsum"].isna(), "mobility_disability_binary"] = np.nan
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. LV — Last Visit (one visit per subject, full clinical)
-# ═══════════════════════════════════════════════════════════════════════════
-if EXPORT_LV:
-    merged_lv = gait.merge(lv, on=["projid", "fu_year"], how="inner")
-    merged_lv = derive_binary_outcomes(merged_lv)
+    if "falls" in df.columns:
+        df["falls_binary"] = (df["falls"] > 0).astype(float)
+        df.loc[df["falls"].isna(), "falls_binary"] = np.nan
+    elif "falls_binary" not in df.columns:
+        df["falls_binary"] = np.nan
 
-    # Add demographics from ABL (age_bl, msex, educ, race7 only in ABL)
-    demo_cols = ["projid", "age_bl", "msex", "educ", "race7"]
-    demo = abl[demo_cols].drop_duplicates(subset="projid")
-    merged_lv = merged_lv.merge(demo, on="projid", how="left")
-    merged_lv["age_at_visit"] = merged_lv["age_bl"] + merged_lv["fu_year"]
+    if "dcfdx" in df.columns:
+        df["cognitive_impairment"] = (df["dcfdx"] > 1).astype(float)
+        df.loc[df["dcfdx"].isna(), "cognitive_impairment"] = np.nan
+    elif "dcfdx_3gp" in df.columns:
+        df["cognitive_impairment"] = (df["dcfdx_3gp"] > 1).astype(float)
+        df.loc[df["dcfdx_3gp"].isna(), "cognitive_impairment"] = np.nan
+    else:
+        df["cognitive_impairment"] = np.nan
 
-    print(f"\n[LV] Merged: {merged_lv.shape[0]} rows, {merged_lv.shape[1]} cols")
-    print(f"  Unique subjects: {merged_lv['projid'].nunique()}")
-    print_outcome_summary(merged_lv, "LV")
+    if "age_bl" in df.columns and "fu_year" in df.columns:
+        df["age_at_visit"] = df["age_bl"] + df["fu_year"]
 
-    merged_lv.to_csv("output/merged_gait_clinical_lv.csv", index=False)
-    print(f"  -> Saved: output/merged_gait_clinical_lv.csv")
+    return df
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. All Valid Visits (multiple visits per subject, limited outcomes)
+# UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
-if EXPORT_ALL_VISITS:
-    allv_renamed = allv.rename(columns={
+
+def save(df, filename):
+    path = os.path.join(OUTPUT_DIR, filename)
+    df.to_csv(path, index=False)
+    print(f"Saved -> {path}")
+
+
+def print_summary(df, label):
+    print(f"\n[{label}] shape={df.shape}, subjects={df['projid'].nunique()}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MERGE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def merge_abl(gait, abl):
+    df = gait.merge(abl, on=["projid", "fu_year"], how="inner")
+    df = derive_binary_outcomes(df)
+    print_summary(df, "ABL")
+    save(df, "merged_gait_clinical_abl.csv")
+
+
+def merge_lv(gait, lv, abl):
+    df = gait.merge(lv, on=["projid", "fu_year"], how="inner")
+
+    demo = abl[["projid", "age_bl", "msex", "educ", "race7"]].drop_duplicates("projid")
+    df = df.merge(demo, on="projid", how="left")
+
+    df = derive_binary_outcomes(df)
+    print_summary(df, "LV")
+    save(df, "merged_gait_clinical_lv.csv")
+
+
+def merge_all_visits(gait, allv, abl):
+    allv = allv.rename(columns={
         "parkinsonism_YN": "parkinsonism_yn",
         "falls_yn": "falls_binary",
-        "dcfdx_3gp": "dcfdx_3gp",
-    }).drop_duplicates(subset=["projid", "fu_year"])
+    }).drop_duplicates(["projid", "fu_year"])
 
-    merged_allv = gait.merge(allv_renamed, on=["projid", "fu_year"], how="inner")
-    merged_allv = derive_binary_outcomes(merged_allv)
+    df = gait.merge(allv, on=["projid", "fu_year"], how="inner")
 
-    # Add demographics from ABL
-    demo_cols = ["projid", "age_bl", "msex", "educ", "race7"]
-    demo = abl[demo_cols].drop_duplicates(subset="projid")
-    merged_allv = merged_allv.merge(demo, on="projid", how="left")
-    merged_allv["age_at_visit"] = merged_allv["age_bl"] + merged_allv["fu_year"]
+    demo = abl[["projid", "age_bl", "msex", "educ", "race7"]].drop_duplicates("projid")
+    df = df.merge(demo, on="projid", how="left")
 
-    print(f"\n[ALL VISITS] Merged: {merged_allv.shape[0]} rows, {merged_allv.shape[1]} cols")
-    print(f"  Unique subjects: {merged_allv['projid'].nunique()}")
-    print(f"  Note: limited outcomes (dcfdx_3gp, parkinsonism_yn, rosbsum, falls_binary)")
-    print_outcome_summary(merged_allv, "All Visits")
+    df = derive_binary_outcomes(df)
+    print_summary(df, "ALL_VISITS")
+    save(df, "merged_gait_clinical_allvisits.csv")
 
-    merged_allv.to_csv("output/merged_gait_clinical_allvisits.csv", index=False)
-    print(f"  -> Saved: output/merged_gait_clinical_allvisits.csv")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. Postmortem — ABL gait + postmortem pathology indices
-# ═══════════════════════════════════════════════════════════════════════════
-if EXPORT_POSTMORTEM:
-    # Start from ABL merge, then add postmortem by projid
-    merged_pm = gait.merge(abl, on=["projid", "fu_year"], how="inner")
-    merged_pm = merged_pm.merge(postmortem.drop(columns=["study"], errors="ignore"),
-                                on="projid", how="inner")
-    merged_pm = derive_binary_outcomes(merged_pm)
+def merge_postmortem(gait, abl, postmortem):
+    df = gait.merge(abl, on=["projid", "fu_year"], how="inner")
+    df = df.merge(postmortem.drop(columns=["study"], errors="ignore"), on="projid", how="inner")
 
-    print(f"\n[POSTMORTEM] Merged: {merged_pm.shape[0]} rows, {merged_pm.shape[1]} cols")
-    print(f"  Unique subjects: {merged_pm['projid'].nunique()}")
-    pm_cols = [c for c in postmortem.columns if c not in ["projid", "study"]]
-    for c in pm_cols:
-        n = merged_pm[c].notna().sum()
-        print(f"    {c:25s}  n={n}")
-
-    merged_pm.to_csv("output/merged_gait_clinical_postmortem.csv", index=False)
-    print(f"  -> Saved: output/merged_gait_clinical_postmortem.csv")
+    df = derive_binary_outcomes(df)
+    print_summary(df, "POSTMORTEM")
+    save(df, "merged_gait_clinical_postmortem.csv")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Feature bucket summary
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════
-daily_pa_cols = [c for c in gait.columns
-                 if c.startswith("daily_pa_mean_") or c.startswith("daily_pa_std_") or c.startswith("tdpa_")]
-id_cols = ["sub_id", "projid", "fu_year", "wear_days"]
-gait_bout_cols = [c for c in gait.columns
-                  if c not in id_cols and c not in daily_pa_cols]
 
-print(f"\nFeature buckets (from gait data):")
-print(f"  Daily PA variables: {len(daily_pa_cols)}")
-print(f"  Gait bout metrics:  {len(gait_bout_cols)}")
+def main():
+    gait, sheets = load_data()
+
+    if EXPORT_FLAGS["ABL"]:
+        merge_abl(gait, sheets["abl"])
+
+    if EXPORT_FLAGS["LV"]:
+        merge_lv(gait, sheets["lv"], sheets["abl"])
+
+    if EXPORT_FLAGS["ALL_VISITS"]:
+        merge_all_visits(gait, sheets["allv"], sheets["abl"])
+
+    if EXPORT_FLAGS["POSTMORTEM"]:
+        merge_postmortem(gait, sheets["abl"], sheets["postmortem"])
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
