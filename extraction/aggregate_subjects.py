@@ -54,20 +54,27 @@ logger = logging.getLogger(__name__)
 # Global histogram bin ranges (ensures cross-subject comparability)
 # ============================================================================
 
+# Metrics that get log1p-transformed before histogram binning.
+# Their GLOBAL_RANGES entries are specified on the log1p scale.
+LOG_TRANSFORM_METRICS = {'duration_sec', 'total_steps', 'psd_amp', 'psd_slope'}
+
 GLOBAL_RANGES = {
-    'duration_sec':         {'min': 10,  'max': 3200},
-    'speed':                {'min': 0,   'max': 1.8},
-    'cadence':              {'min': 40,  'max': 160},
-    'gait_length':          {'min': 0,   'max': 2},
-    'gait_length_indirect': {'min': 0,   'max': 2},
-    'regularity_eldernet':  {'min': 0,   'max': 1},
-    'regularity_sp':        {'min': 0,   'max': 1},
-    'entropy':              {'min': 0,   'max': 3},
-    'dom_freq':             {'min': 0,   'max': 15},
-    'psd_amp':              {'min': 0,   'max': 2.5},
-    'psd_width':            {'min': 0,   'max': 1.0},
-    'psd_slope':            {'min': 0,   'max': 300},
-    'pa_amplitude':         {'min': 0.8, 'max': 2.0},
+    # --- Log-scale ranges (applied after np.log1p) ---
+    'duration_sec':         {'min': np.log1p(10),   'max': np.log1p(500)},    # raw ~10-500s covers p1-p99 of p90
+    'total_steps':          {'min': np.log1p(5),    'max': np.log1p(500)},    # raw ~5-500 steps
+    'psd_amp':              {'min': np.log1p(0),    'max': np.log1p(0.15)},   # raw 0-0.15 covers p99 of p90
+    'psd_slope':            {'min': np.log1p(0),    'max': np.log1p(0.5)},    # raw 0-0.5 covers p99 of p90
+    # --- Linear ranges (tightened to actual data spread) ---
+    'speed':                {'min': 0.1,   'max': 1.5},
+    'cadence':              {'min': 60,    'max': 140},
+    'gait_length':          {'min': 0.2,   'max': 1.5},
+    'gait_length_indirect': {'min': 0.1,   'max': 1.5},
+    'regularity_eldernet':  {'min': 0,     'max': 0.8},
+    'regularity_sp':        {'min': 0,     'max': 0.85},
+    'entropy':              {'min': 0.3,   'max': 2.5},
+    'dom_freq':             {'min': 0.5,   'max': 4.0},
+    'psd_width':            {'min': 0.2,   'max': 1.0},
+    'pa_amplitude':         {'min': 0.98,  'max': 1.12},
 }
 
 N_BINS = 10
@@ -237,7 +244,12 @@ def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
 
 def _histogram_features(data: np.ndarray, prefix: str, metric_name: str,
                         n_bins: int = N_BINS) -> dict:
-    """Compute histogram frequency and probability features with global bins."""
+    """
+    Compute histogram frequency and probability features with global bins.
+
+    For metrics in LOG_TRANSFORM_METRICS, applies np.log1p before binning.
+    The corresponding GLOBAL_RANGES entries are already on the log1p scale.
+    """
     data = np.asarray(data, dtype=float)
     data = data[np.isfinite(data)]
 
@@ -247,6 +259,10 @@ def _histogram_features(data: np.ndarray, prefix: str, metric_name: str,
             result[f'{prefix}freq_bin{i}'] = 0
             result[f'{prefix}prob_bin{i}'] = 0.0
         return result
+
+    # Apply log-transform for heavily right-skewed metrics
+    if metric_name in LOG_TRANSFORM_METRICS:
+        data = np.log1p(data)
 
     # Use global range if available, else data range
     if metric_name in GLOBAL_RANGES:
@@ -801,22 +817,6 @@ def _aggregate_single_dir(base_dir: Path, device: str = None,
 
         # Apply standard preprocessing (rename + outlier filtering)
         bout_df = _preprocess_bout_df(bout_df, subject_id=subject_id)
-
-        # Backward-compat: rename old column names from existing CSVs
-        bout_df.rename(columns={
-            'bout_pa_mean': 'pa_amplitude',
-            'bout_pa_std': 'pa_variability',
-        }, inplace=True)
-
-        # Filter outlier bouts
-        n_before = len(bout_df)
-        if 'duration_sec' in bout_df.columns:
-            bout_df = bout_df[bout_df['duration_sec'] <= 10000]
-        if 'pa_amplitude' in bout_df.columns:
-            bout_df = bout_df[bout_df['pa_amplitude'] <= 5]
-        n_dropped = n_before - len(bout_df)
-        if n_dropped > 0:
-            logger.info(f"  {subject_id}: dropped {n_dropped} outlier bouts (duration>10000s or PA>5)")
 
         window_file = window_dir / f'{subject_id}.csv'
         window_df = pd.read_csv(window_file) if window_file.exists() else pd.DataFrame()
