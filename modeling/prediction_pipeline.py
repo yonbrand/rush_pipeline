@@ -120,6 +120,17 @@ gait_bout_cols = [
     and not c.startswith("daily_pa_std_")
     and not c.startswith("tdpa_")
 ]
+
+# ── Drop prob_bin* features (exact duplicates of freq_bin*) ──────────────────
+# For every bout metric, prob_bin_i == freq_bin_i / Σ freq_bin_j (r = 1.0 for
+# all pairs).  Keeping both inflates the feature space by 150 columns with zero
+# additional information and biases univariate feature-selection towards the
+# histogram representation.  We retain the freq_bin (count) variants.
+_n_before = len(gait_bout_cols)
+gait_bout_cols = [c for c in gait_bout_cols if "_prob_bin" not in c]
+print(f"Dropped {_n_before - len(gait_bout_cols)} prob_bin* features "
+      f"(redundant with freq_bin*)")
+
 demographic_cols = ["age_at_visit", "msex", "educ"]
 
 print(f"Gait bout features: {len(gait_bout_cols)}")
