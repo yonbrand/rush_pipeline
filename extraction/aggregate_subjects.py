@@ -54,8 +54,11 @@ logger = logging.getLogger(__name__)
 # Global histogram bin ranges (ensures cross-subject comparability)
 # ============================================================================
 
-# Metrics that get log1p-transformed before histogram binning.
-# Their GLOBAL_RANGES entries are specified on the log1p scale.
+# Metrics that get log1p-transformed before histogram binning AND before
+# computing shape/distributional statistics (skewness, kurtosis, L-moments,
+# CV, dip test, entropy, Wasserstein).  Location statistics (mean, median,
+# percentiles, range, IQR, MAD) are always computed on the raw scale so they
+# remain clinically interpretable.
 LOG_TRANSFORM_METRICS = {'duration_sec', 'total_steps', 'psd_amp', 'psd_slope'}
 
 GLOBAL_RANGES = {
@@ -137,11 +140,11 @@ def aggregate_subject(
         prefix = f'bout_{metric}_'
         if metric in bout_df.columns:
             data = bout_df[metric].dropna().values
-            row.update(_calc_stats(data, prefix))
+            row.update(_calc_stats(data, prefix, metric_name=metric))
             if include_hist_bins:
                 row.update(_histogram_features(data, prefix, metric))
         else:
-            row.update(_calc_stats(np.array([]), prefix))
+            row.update(_calc_stats(np.array([]), prefix, metric_name=metric))
 
     # --- Distribution shape metrics (Dip, Entropy, Wasserstein to Normal) ---
     row.update(_calc_distribution_shape(bout_df))
@@ -176,9 +179,34 @@ def aggregate_subject(
 # Statistics helpers
 # ============================================================================
 
-def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
+def _maybe_log_transform(data: np.ndarray, metric_name: str | None) -> np.ndarray:
+    """
+    Return log1p-transformed data if the metric is in LOG_TRANSFORM_METRICS,
+    otherwise return data unchanged.
+    """
+    if metric_name is not None and metric_name in LOG_TRANSFORM_METRICS:
+        return np.log1p(data)
+    return data
+
+
+def _calc_stats(
+    data: np.ndarray,
+    prefix: str,
+    robust: bool = True,
+    metric_name: str | None = None,
+) -> dict:
     """
     Compute descriptive statistics for an array.
+
+    Location / spread statistics (mean, median, percentiles, range, IQR, std,
+    MAD) are always computed on the **raw** scale so they stay clinically
+    interpretable.
+
+    Shape statistics (skewness, kurtosis, L-skewness, L-kurtosis, CV) are
+    computed on **log1p-transformed** data when the metric is listed in
+    LOG_TRANSFORM_METRICS, because heavy right-skew makes raw-scale shape
+    metrics dominated by the tail rather than capturing meaningful between-
+    subject differences.
 
     Args:
         data: Input array.
@@ -186,6 +214,7 @@ def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
         robust: If True, also compute MAD, L-skewness, and L-kurtosis.
                 Set to False for daily-level metrics (few observations) to
                 avoid blank columns in the output.
+        metric_name: Name of the metric (used to decide log-transform).
     """
     if not isinstance(data, np.ndarray):
         data = np.array(data, dtype=float)
@@ -202,8 +231,10 @@ def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
     if len(data) == 0:
         return nan_dict
 
-    mean_val = np.mean(data)
     n = len(data)
+
+    # --- Location / spread statistics (always raw scale) ---
+    mean_val = np.mean(data)
 
     result = {
         f'{prefix}median': float(np.median(data)),
@@ -211,29 +242,33 @@ def _calc_stats(data: np.ndarray, prefix: str, robust: bool = True) -> dict:
         f'{prefix}std': float(np.std(data)),
         f'{prefix}p10': float(np.percentile(data, 10)),
         f'{prefix}p90': float(np.percentile(data, 90)),
-        f'{prefix}kurtosis': float(kurtosis(data)) if n > 3 else np.nan,
-        f'{prefix}skewness': float(skew(data)) if n > 3 else np.nan,
         f'{prefix}range': float(np.ptp(data)),
         f'{prefix}iqr': float(np.percentile(data, 75) - np.percentile(data, 25)),
-        f'{prefix}cv': float(np.std(data) / mean_val) if mean_val != 0 else np.nan,
     }
 
+    # --- Shape statistics (log-transformed for skewed metrics) ---
+    shape_data = _maybe_log_transform(data, metric_name)
+    shape_mean = np.mean(shape_data)
+
+    result[f'{prefix}kurtosis'] = float(kurtosis(shape_data)) if n > 3 else np.nan
+    result[f'{prefix}skewness'] = float(skew(shape_data)) if n > 3 else np.nan
+    result[f'{prefix}cv'] = float(np.std(shape_data) / shape_mean) if shape_mean != 0 else np.nan
+
     if robust:
-        # Compute MAD (Median Absolute Deviation)
+        # MAD on raw scale (it's a spread statistic, robust to skew already)
         mad_val = float(median_abs_deviation(data, nan_policy='omit')) if n >= MIN_SAMPLE_SIZE else np.nan
 
-        # Compute L-moments (L-skewness and L-kurtosis)
+        # L-moments on log-transformed scale for skewed metrics
         l_skew = np.nan
         l_kurt = np.nan
         if HAS_LMOMENTS and n >= MIN_SAMPLE_SIZE:
             try:
-                # lmoments3.lmom_ratios returns [l1, l2, t3, t4, ...] where t3=L-skewness, t4=L-kurtosis
-                lmom_ratios = lm.lmom_ratios(data, nmom=4)
+                lmom_ratios = lm.lmom_ratios(shape_data, nmom=4)
                 if len(lmom_ratios) >= 4:
                     l_skew = float(lmom_ratios[2]) if np.isfinite(lmom_ratios[2]) else np.nan
                     l_kurt = float(lmom_ratios[3]) if np.isfinite(lmom_ratios[3]) else np.nan
             except Exception:
-                pass  # Keep NaN on any computation error
+                pass
 
         result[f'{prefix}mad'] = mad_val
         result[f'{prefix}l_skewness'] = l_skew
@@ -366,6 +401,10 @@ def _calc_distribution_shape(bout_df: pd.DataFrame) -> dict:
     - Shannon Entropy: Measures distributional complexity/uniformity
     - Wasserstein Distance to Gaussian: Measures deviation from normality
 
+    For metrics in LOG_TRANSFORM_METRICS, all shape computations are performed
+    on log1p-transformed data so that heavy right-skew does not dominate the
+    statistics.
+
     Args:
         bout_df: DataFrame with bout-level features.
 
@@ -386,9 +425,12 @@ def _calc_distribution_shape(bout_df: pd.DataFrame) -> dict:
         if metric not in bout_df.columns:
             continue
 
-        data = bout_df[metric].dropna().values
-        if len(data) < MIN_SAMPLE_SIZE:
+        raw_data = bout_df[metric].dropna().values
+        if len(raw_data) < MIN_SAMPLE_SIZE:
             continue
+
+        # Use log-transformed data for shape analysis when appropriate
+        data = _maybe_log_transform(raw_data, metric)
 
         # --- Hartigan's Dip Statistic ---
         if HAS_DIPTEST:
@@ -412,7 +454,6 @@ def _calc_distribution_shape(bout_df: pd.DataFrame) -> dict:
 
             bins = np.linspace(lo, hi, N_BINS + 1)
             counts, _ = np.histogram(data, bins=bins)
-            # Add small constant to avoid log(0)
             probs = counts / counts.sum()
             # Use scipy.stats.entropy which handles zeros gracefully
             result[f'{prefix}shannon_entropy'] = float(entropy(probs + 1e-10))
@@ -421,13 +462,10 @@ def _calc_distribution_shape(bout_df: pd.DataFrame) -> dict:
 
         # --- Wasserstein Distance to Gaussian ---
         try:
-            # Fit normal distribution to data
             mu, sigma = norm.fit(data)
             if sigma > 0:
-                # Generate theoretical normal sample with same size
                 np.random.seed(42)  # Reproducibility
                 normal_sample = norm.rvs(loc=mu, scale=sigma, size=len(data))
-                # Compute Wasserstein (Earth Mover's) distance
                 w_dist = wasserstein_distance(data, normal_sample)
                 result[f'{prefix}wasserstein_to_normal'] = float(w_dist)
         except Exception:
@@ -447,6 +485,10 @@ def _calc_between_day_stability(bout_df: pd.DataFrame) -> dict:
     For each core metric, computes pairwise Wasserstein distances between
     daily distributions and returns the mean pairwise distance as a measure
     of global stability/drift.
+
+    For metrics in LOG_TRANSFORM_METRICS, distances are computed on the
+    log1p-transformed scale so that a few extreme bouts do not dominate the
+    stability measure.
 
     Args:
         bout_df: DataFrame with bout-level features including 'start_time'.
@@ -481,13 +523,12 @@ def _calc_between_day_stability(bout_df: pd.DataFrame) -> dict:
         if metric not in df.columns:
             continue
 
-        # Build per-day distributions
+        # Build per-day distributions (log-transform if needed)
         daily_data = {}
         for day in days:
             day_vals = df[df['day'] == day][metric].dropna().values
-            # Require minimum sample size per day
             if len(day_vals) >= MIN_SAMPLE_SIZE:
-                daily_data[day] = day_vals
+                daily_data[day] = _maybe_log_transform(day_vals, metric)
 
         if len(daily_data) < 2:
             continue
