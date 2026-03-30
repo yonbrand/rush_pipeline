@@ -164,6 +164,28 @@ EXTRA_FEATURE_SETS = {
     "Combined + 8ft Speed": gait_bout_cols + daily_pa_cols + ["gait_speed"],
 }
 
+# ── Domain definitions for Block PCA (Lord et al. 2013, extended) ────────────
+# Maps domain names to column-name prefixes.  Each gait feature is assigned to
+# exactly one domain based on the *first matching prefix* in order.
+# Domains extend the established 5-factor gait model (pace, rhythm, variability,
+# asymmetry, postural control) to the free-living wearable context, adding
+# spectral/complexity, day-to-day consistency, quantity, and temporal pattern
+# domains that are only capturable with continuous multi-day monitoring.
+GAIT_DOMAINS = {
+    "Speed":              ["bout_speed"],
+    "Gait Length":        ["bout_gait_length_indirect", "bout_gait_length"],
+    "Cadence":            ["bout_cadence"],
+    "Regularity":         ["bout_regularity_eldernet", "bout_regularity_sp"],
+    "Gait Quantity":      ["bout_duration", "bout_total", "daily_n_bouts",
+                           "daily_step", "daily_walking", "n_bouts"],
+    "Bout Intensity":     ["bout_pa_amplitude", "bout_pa_variability"],
+    "Within-Bout Var":    ["var_var"],
+    "Spectral/Complexity":["bout_entropy", "bout_dom", "bout_psd_amp",
+                           "bout_psd_width", "bout_psd_slope"],
+    "Day-to-Day":         ["stability_", "dist_"],
+    "Temporal Pattern":   ["tod_"],
+}
+
 SELECTION_STRATEGIES = [
     "No Selection",
     "SelectKBest",
@@ -173,6 +195,7 @@ SELECTION_STRATEGIES = [
     "PCA",
     "Stability",
     "mRMR",
+    "Block PCA",
 ]
 
 
@@ -376,6 +399,102 @@ class MRMRSelector(BaseEstimator, TransformerMixin):
     def transform(self, X):
         return X[:, self.mask_]
 
+
+class BlockPCATransformer(BaseEstimator, TransformerMixin):
+    """
+    Domain-grouped PCA: apply PCA independently within each gait domain,
+    then concatenate the resulting components.
+
+    This is a *self-contained* preprocessor: it handles imputation, scaling,
+    and per-domain PCA internally so that domain-to-column mappings are
+    preserved (the standard preprocessing steps drop columns by index,
+    which would break the mapping).
+
+    Features that do not match any domain (e.g. demographics) are passed
+    through after scaling without dimensionality reduction.
+
+    Parameters
+    ----------
+    feature_names : list[str]
+        Column names matching the X matrix at input time.
+    domain_map : dict[str, list[str]]
+        {domain_name: [prefix, ...]} — see GAIT_DOMAINS.
+    variance_retained : float
+        Fraction of variance to retain per domain (default 0.80).
+    """
+
+    def __init__(self, feature_names, domain_map=None, variance_retained=0.80):
+        self.feature_names = feature_names
+        self.domain_map = domain_map or GAIT_DOMAINS
+        self.variance_retained = variance_retained
+
+    def _assign_domains(self):
+        """Map each feature index to a domain (or 'passthrough')."""
+        assignments = {}
+        assigned = set()
+        for domain, prefixes in self.domain_map.items():
+            idxs = []
+            for i, name in enumerate(self.feature_names):
+                if i not in assigned and any(name.startswith(p) for p in prefixes):
+                    idxs.append(i)
+                    assigned.add(i)
+            if idxs:
+                assignments[domain] = idxs
+        # Unmatched features (demographics, etc.) pass through
+        remaining = [i for i in range(len(self.feature_names)) if i not in assigned]
+        if remaining:
+            assignments["_passthrough"] = remaining
+        return assignments
+
+    def fit(self, X, y=None):
+        self.domain_indices_ = self._assign_domains()
+        self.imputers_ = {}
+        self.scalers_ = {}
+        self.pcas_ = {}
+
+        for domain, idxs in self.domain_indices_.items():
+            Xd = X[:, idxs].astype(float)
+
+            # Impute & scale
+            imp = SimpleImputer(strategy="median")
+            Xd = imp.fit_transform(Xd)
+            sc = StandardScaler()
+            Xd = sc.fit_transform(Xd)
+            self.imputers_[domain] = imp
+            self.scalers_[domain] = sc
+
+            if domain == "_passthrough" or Xd.shape[1] <= 2:
+                # Too few features for PCA — pass through
+                self.pcas_[domain] = None
+            else:
+                n_comp = min(
+                    Xd.shape[0], Xd.shape[1],
+                    max(2, Xd.shape[1])  # upper bound
+                )
+                pca = PCA(n_components=n_comp, svd_solver="full")
+                pca.fit(Xd)
+                cumvar = np.cumsum(pca.explained_variance_ratio_)
+                k = int(np.searchsorted(cumvar, self.variance_retained)) + 1
+                k = max(2, min(k, Xd.shape[1]))
+                # Re-fit with chosen k
+                pca_final = PCA(n_components=k, svd_solver="full")
+                pca_final.fit(Xd)
+                self.pcas_[domain] = pca_final
+
+        return self
+
+    def transform(self, X):
+        blocks = []
+        for domain, idxs in self.domain_indices_.items():
+            Xd = X[:, idxs].astype(float)
+            Xd = self.imputers_[domain].transform(Xd)
+            Xd = self.scalers_[domain].transform(Xd)
+            if self.pcas_[domain] is not None:
+                Xd = self.pcas_[domain].transform(Xd)
+            blocks.append(Xd)
+        return np.hstack(blocks)
+
+
 def _mi_classif(X, y):
     return mutual_info_classif(X, y, random_state=42)
 
@@ -399,15 +518,36 @@ def _preprocessing_steps():
     ]
 
 
-def build_pipeline_and_grid(model, model_params, selection_strategy, task_type):
+def build_pipeline_and_grid(model, model_params, selection_strategy, task_type,
+                            feature_names=None):
     """
     Build a full sklearn Pipeline and a combined parameter grid
     that jointly tunes model hyperparameters and selection params.
 
+    Parameters
+    ----------
+    feature_names : list[str] or None
+        Required only for "Block PCA" strategy.
+
     Returns (Pipeline, param_grid dict).
     """
-    steps = _preprocessing_steps()
     extra_grid = {}
+
+    # Block PCA uses its own preprocessing (impute + scale per domain),
+    # so the pipeline is shorter — no standard preprocessing steps.
+    if selection_strategy == "Block PCA":
+        if feature_names is None:
+            raise ValueError("Block PCA requires feature_names")
+        steps = [
+            ("block_pca", BlockPCATransformer(
+                feature_names=feature_names,
+                domain_map=GAIT_DOMAINS,
+                variance_retained=0.80)),
+            ("model", model),
+        ]
+        return Pipeline(steps), {**model_params, **extra_grid}
+
+    steps = _preprocessing_steps()
 
     if selection_strategy == "No Selection":
         pass
@@ -504,13 +644,13 @@ def get_reg_models():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def prepare_data(df, feature_cols, outcome_col, demographics=True):
-    """Subset columns and drop rows missing the outcome. Returns raw X array and y."""
+    """Subset columns and drop rows missing the outcome. Returns raw X array, y, and feature names."""
     feature_part = list(feature_cols) + (demographic_cols if demographics else [])
     cols = feature_part + [outcome_col]
     sub = df[cols].dropna(subset=[outcome_col])
     y = sub[outcome_col].values
     X = sub[feature_part].values.astype(float)
-    return X, y
+    return X, y, feature_part
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,7 +774,7 @@ def compare_feature_sets(all_results, metric, n_splits=5, n_repeats=3):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
-                   selection_strategies=None):
+                   selection_strategies=None, feature_names=None):
     """
     Nested CV over all (selection × model) combinations for one
     outcome × feature-set pair.
@@ -647,6 +787,8 @@ def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
     selection_strategies : list[str] or None
         Subset of SELECTION_STRATEGIES to evaluate.  Defaults to all.
         Use ["No Selection"] for baseline feature sets with few features.
+    feature_names : list[str] or None
+        Column names for X.  Required if "Block PCA" is in strategies.
     """
     if selection_strategies is None:
         selection_strategies = SELECTION_STRATEGIES
@@ -677,7 +819,8 @@ def run_nested_cv(X, y, task_type, outcome_name, feature_set_name,
         for model_name, (model_instance, model_params) in model_defs.items():
             try:
                 pipe, grid = build_pipeline_and_grid(
-                    clone(model_instance), model_params, sel_name, task_type)
+                    clone(model_instance), model_params, sel_name, task_type,
+                    feature_names=feature_names)
 
                 grid_search = GridSearchCV(
                     pipe, grid,
@@ -790,19 +933,20 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
 
     # Sensor-based feature sets (full selection strategy sweep)
     for fs_name, fs_cols in FEATURE_SETS.items():
-        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y, feat_names = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
             print(f"  {fs_name}: skipped (n={len(y)}, pos={y.sum():.0f})")
             continue
         print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}, "
               f"prevalence={y.mean():.2%}")
 
-        results = run_nested_cv(X, y, "classification", outcome_name, fs_name)
+        results = run_nested_cv(X, y, "classification", outcome_name, fs_name,
+                                feature_names=feat_names)
         all_clf_results.extend(results)
 
     # Clinical baseline & augmented feature sets
     for fs_name, fs_cols in EXTRA_FEATURE_SETS.items():
-        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y, feat_names = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50 or y.sum() < 10 or (len(y) - y.sum()) < 10:
             print(f"  {fs_name}: skipped (n={len(y)}, pos={y.sum():.0f})")
             continue
@@ -815,7 +959,7 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
               + (" [baseline — No Selection only]" if is_baseline else ""))
 
         results = run_nested_cv(X, y, "classification", outcome_name, fs_name,
-                                selection_strategies=sel)
+                                selection_strategies=sel, feature_names=feat_names)
         all_clf_results.extend(results)
 
 print("\n" + "=" * 70)
@@ -829,18 +973,19 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
 
     # Sensor-based feature sets (full selection strategy sweep)
     for fs_name, fs_cols in FEATURE_SETS.items():
-        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y, feat_names = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50:
             print(f"  {fs_name}: skipped (n={len(y)})")
             continue
         print(f"\n  {fs_name}: n={len(y)}, raw_features={X.shape[1]}")
 
-        results = run_nested_cv(X, y, "regression", outcome_name, fs_name)
+        results = run_nested_cv(X, y, "regression", outcome_name, fs_name,
+                                feature_names=feat_names)
         all_reg_results.extend(results)
 
     # Clinical baseline & augmented feature sets
     for fs_name, fs_cols in EXTRA_FEATURE_SETS.items():
-        X, y = prepare_data(df, fs_cols, outcome_col, demographics=True)
+        X, y, feat_names = prepare_data(df, fs_cols, outcome_col, demographics=True)
         if len(y) < 50:
             print(f"  {fs_name}: skipped (n={len(y)})")
             continue
@@ -852,7 +997,7 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
               + (" [baseline — No Selection only]" if is_baseline else ""))
 
         results = run_nested_cv(X, y, "regression", outcome_name, fs_name,
-                                selection_strategies=sel)
+                                selection_strategies=sel, feature_names=feat_names)
         all_reg_results.extend(results)
 
 # ── Statistical comparison of feature sets ───────────────────────────────────
