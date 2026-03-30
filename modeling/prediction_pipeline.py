@@ -73,6 +73,7 @@ from sklearn.feature_selection import (
 )
 from sklearn.decomposition import PCA
 from sklearn.metrics import make_scorer, f1_score, balanced_accuracy_score
+from sklearn.utils import resample
 
 try:
     from xgboost import XGBClassifier, XGBRegressor
@@ -170,6 +171,8 @@ SELECTION_STRATEGIES = [
     "L1-based",
     "Consensus",
     "PCA",
+    "Stability",
+    "mRMR",
 ]
 
 
@@ -198,7 +201,7 @@ class MissingRateFilter(BaseEstimator, TransformerMixin):
 class CorrelationFilter(BaseEstimator, TransformerMixin):
     """Drop features with pairwise |r| > *threshold* (keep the earlier column)."""
 
-    def __init__(self, threshold=0.95):
+    def __init__(self, threshold=0.85):
         self.threshold = threshold
 
     def fit(self, X, y=None):
@@ -243,7 +246,7 @@ class ConsensusSelector(BaseEstimator, TransformerMixin):
 
         if self.task_type == "classification":
             l1_est = LogisticRegression(
-                penalty="l1", solver="saga", C=0.1,
+                l1_ratio=1.0, solver="saga", C=0.1,
                 max_iter=5000, class_weight="balanced", random_state=42)
         else:
             l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
@@ -261,7 +264,117 @@ class ConsensusSelector(BaseEstimator, TransformerMixin):
         return X[:, self.mask_]
 
 
-# ── Reproducible MI wrappers (fix random_state) ─────────────────────────────
+class StabilitySelector(BaseEstimator, TransformerMixin):
+    """
+    Stability Selection (Meinshausen & Bühlmann, 2010).
+
+    Runs L1-penalised models on *n_bootstrap* random sub-samples of the
+    training fold and retains features selected in ≥ *threshold* fraction
+    of runs.  Controls false-discovery rate much better than a single L1
+    fit, especially when p >> n.
+    """
+
+    def __init__(self, task_type="classification", n_bootstrap=50,
+                 sample_fraction=0.7, threshold=0.6):
+        self.task_type = task_type
+        self.n_bootstrap = n_bootstrap
+        self.sample_fraction = sample_fraction
+        self.threshold = threshold
+
+    def fit(self, X, y):
+        n_samples, n_features = X.shape
+        counts = np.zeros(n_features)
+        sub_n = max(10, int(n_samples * self.sample_fraction))
+
+        for i in range(self.n_bootstrap):
+            idx = resample(np.arange(n_samples), n_samples=sub_n,
+                           random_state=42 + i, replace=False)
+            X_sub, y_sub = X[idx], y[idx]
+
+            if self.task_type == "classification":
+                est = LogisticRegression(
+                    l1_ratio=1.0, solver="saga", C=0.1,
+                    max_iter=5000, class_weight="balanced", random_state=42)
+            else:
+                est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
+
+            est.fit(X_sub, y_sub)
+            coefs = np.abs(est.coef_).ravel()
+            if len(coefs) == n_features:
+                counts += (coefs > 1e-10).astype(int)
+
+        scores = counts / self.n_bootstrap
+        self.mask_ = scores >= self.threshold
+        # Fallback: if too few selected, take top-20 by stability score
+        if self.mask_.sum() < 5:
+            top_k = min(20, n_features)
+            self.mask_ = np.zeros(n_features, dtype=bool)
+            self.mask_[np.argsort(scores)[-top_k:]] = True
+        return self
+
+    def transform(self, X):
+        return X[:, self.mask_]
+
+
+class MRMRSelector(BaseEstimator, TransformerMixin):
+    """
+    Minimum Redundancy Maximum Relevance (Peng, Long & Ding, 2005).
+
+    Greedy forward selection: at each step pick the feature that maximises
+    relevance(feature, target) − mean_redundancy(feature, already_selected).
+
+    Relevance = mutual information with target.
+    Redundancy = squared Pearson correlation (fast proxy for MI between
+    continuous features; avoids O(k²) MI estimation at each step).
+    """
+
+    def __init__(self, task_type="classification", k=20):
+        self.task_type = task_type
+        self.k = k
+
+    def fit(self, X, y):
+        n_features = X.shape[1]
+        k = min(self.k, n_features)
+
+        # Compute relevance once
+        if self.task_type == "classification":
+            relevance = mutual_info_classif(X, y, random_state=42)
+        else:
+            relevance = mutual_info_regression(X, y, random_state=42)
+
+        # Greedy forward selection
+        selected = []
+        remaining = set(range(n_features))
+
+        # First feature: highest relevance
+        best = max(remaining, key=lambda i: relevance[i])
+        selected.append(best)
+        remaining.remove(best)
+
+        # Pre-compute correlation matrix for fast redundancy lookup
+        corr_matrix = np.corrcoef(X, rowvar=False) ** 2  # squared corr
+
+        for _ in range(k - 1):
+            if not remaining:
+                break
+            best_score = -np.inf
+            best_feat = None
+            sel_arr = np.array(selected)
+            for f in remaining:
+                redundancy = corr_matrix[f, sel_arr].mean()
+                score = relevance[f] - redundancy
+                if score > best_score:
+                    best_score = score
+                    best_feat = f
+            selected.append(best_feat)
+            remaining.remove(best_feat)
+
+        self.mask_ = np.zeros(n_features, dtype=bool)
+        self.mask_[selected] = True
+        return self
+
+    def transform(self, X):
+        return X[:, self.mask_]
 
 def _mi_classif(X, y):
     return mutual_info_classif(X, y, random_state=42)
@@ -281,7 +394,7 @@ def _preprocessing_steps():
         ("miss_filter", MissingRateFilter(threshold=0.6)),
         ("impute", SimpleImputer(strategy="median")),
         ("variance", VarianceThreshold(threshold=1e-8)),
-        ("corr_filter", CorrelationFilter(threshold=0.95)),
+        ("corr_filter", CorrelationFilter(threshold=0.85)),
         ("scale", StandardScaler()),
     ]
 
@@ -309,7 +422,7 @@ def build_pipeline_and_grid(model, model_params, selection_strategy, task_type):
     elif selection_strategy == "L1-based":
         if task_type == "classification":
             l1_est = LogisticRegression(
-                penalty="l1", solver="saga", C=0.1,
+                l1_ratio=1.0, solver="saga", C=0.1,
                 max_iter=5000, class_weight="balanced", random_state=42)
         else:
             l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
@@ -318,6 +431,13 @@ def build_pipeline_and_grid(model, model_params, selection_strategy, task_type):
         steps.append(("select", ConsensusSelector(task_type=task_type, k=30)))
     elif selection_strategy == "PCA":
         steps.append(("select", PCA(n_components=0.95, svd_solver="full")))
+    elif selection_strategy == "Stability":
+        steps.append(("select", StabilitySelector(
+            task_type=task_type, n_bootstrap=50,
+            sample_fraction=0.7, threshold=0.6)))
+    elif selection_strategy == "mRMR":
+        steps.append(("select", MRMRSelector(task_type=task_type, k=20)))
+        extra_grid["select__k"] = [10, 15, 20, 25]
     else:
         raise ValueError(f"Unknown strategy: {selection_strategy}")
 
