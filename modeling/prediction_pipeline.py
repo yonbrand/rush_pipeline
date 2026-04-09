@@ -48,7 +48,7 @@ from itertools import combinations
 
 # Resolve paths relative to the repository root (one level up from modeling/)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_OUTPUT_DIR = os.path.join(_REPO_ROOT, "output")
+_OUTPUT_DIR = os.path.join(_REPO_ROOT, "outputs/tables")
 
 warnings.filterwarnings("ignore")
 
@@ -269,7 +269,7 @@ class ConsensusSelector(BaseEstimator, TransformerMixin):
 
         if self.task_type == "classification":
             l1_est = LogisticRegression(
-                l1_ratio=1.0, solver="saga", C=0.1,
+                penalty='l1', solver="saga", C=0.1,
                 max_iter=5000, class_weight="balanced", random_state=42)
         else:
             l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
