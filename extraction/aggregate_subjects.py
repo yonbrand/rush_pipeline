@@ -179,7 +179,7 @@ def aggregate_subject(
 # Statistics helpers
 # ============================================================================
 
-def _maybe_log_transform(data: np.ndarray, metric_name: str | None) -> np.ndarray:
+def _maybe_log_transform(data: np.ndarray, metric_name: str = None) -> np.ndarray:
     """
     Return log1p-transformed data if the metric is in LOG_TRANSFORM_METRICS,
     otherwise return data unchanged.
@@ -193,7 +193,7 @@ def _calc_stats(
     data: np.ndarray,
     prefix: str,
     robust: bool = True,
-    metric_name: str | None = None,
+    metric_name: str = None,
 ) -> dict:
     """
     Compute descriptive statistics for an array.
