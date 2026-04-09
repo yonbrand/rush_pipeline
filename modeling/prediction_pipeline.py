@@ -196,6 +196,7 @@ SELECTION_STRATEGIES = [
     "Stability",
     "mRMR",
     "Block PCA",
+    "Block PCA + Stability",
 ]
 
 
@@ -545,6 +546,25 @@ def build_pipeline_and_grid(model, model_params, selection_strategy, task_type,
                 variance_retained=0.80)),
             ("model", model),
         ]
+        extra_grid["block_pca__variance_retained"] = [0.70, 0.80, 0.90, 0.95]
+        return Pipeline(steps), {**model_params, **extra_grid}
+
+    if selection_strategy == "Block PCA + Stability":
+        if feature_names is None:
+            raise ValueError("Block PCA + Stability requires feature_names")
+        steps = [
+            ("block_pca", BlockPCATransformer(
+                feature_names=feature_names,
+                domain_map=GAIT_DOMAINS,
+                variance_retained=0.80)),
+            ("rescale", StandardScaler()),
+            ("select", StabilitySelector(
+                task_type=task_type, n_bootstrap=50,
+                sample_fraction=0.7, threshold=0.6)),
+            ("model", model),
+        ]
+        extra_grid["block_pca__variance_retained"] = [0.80, 0.90]
+        extra_grid["select__threshold"] = [0.4, 0.6]
         return Pipeline(steps), {**model_params, **extra_grid}
 
     steps = _preprocessing_steps()
@@ -942,6 +962,10 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
 
         results = run_nested_cv(X, y, "classification", outcome_name, fs_name,
                                 feature_names=feat_names)
+        for r in results:
+            r["_outcome_col"] = outcome_col
+            r["_feature_cols_raw"] = list(fs_cols)
+            r["_task_type"] = "classification"
         all_clf_results.extend(results)
 
     # Clinical baseline & augmented feature sets
@@ -960,6 +984,10 @@ for outcome_col, outcome_name in BINARY_OUTCOMES.items():
 
         results = run_nested_cv(X, y, "classification", outcome_name, fs_name,
                                 selection_strategies=sel, feature_names=feat_names)
+        for r in results:
+            r["_outcome_col"] = outcome_col
+            r["_feature_cols_raw"] = list(fs_cols)
+            r["_task_type"] = "classification"
         all_clf_results.extend(results)
 
 print("\n" + "=" * 70)
@@ -981,6 +1009,10 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
 
         results = run_nested_cv(X, y, "regression", outcome_name, fs_name,
                                 feature_names=feat_names)
+        for r in results:
+            r["_outcome_col"] = outcome_col
+            r["_feature_cols_raw"] = list(fs_cols)
+            r["_task_type"] = "regression"
         all_reg_results.extend(results)
 
     # Clinical baseline & augmented feature sets
@@ -998,6 +1030,10 @@ for outcome_col, outcome_name in CONTINUOUS_OUTCOMES.items():
 
         results = run_nested_cv(X, y, "regression", outcome_name, fs_name,
                                 selection_strategies=sel, feature_names=feat_names)
+        for r in results:
+            r["_outcome_col"] = outcome_col
+            r["_feature_cols_raw"] = list(fs_cols)
+            r["_task_type"] = "regression"
         all_reg_results.extend(results)
 
 # ── Statistical comparison of feature sets ───────────────────────────────────
@@ -1046,12 +1082,12 @@ else:
     print("  No valid comparisons (need ≥2 feature sets with results)")
 
 # ── Save results ─────────────────────────────────────────────────────────────
-# Drop internal per-fold score arrays before saving to CSV
+# Drop internal per-fold score arrays and metadata before saving to CSV
 clf_df = pd.DataFrame(all_clf_results).drop(
-    columns=[c for c in pd.DataFrame(all_clf_results).columns if c.startswith("_fold_")],
+    columns=[c for c in pd.DataFrame(all_clf_results).columns if c.startswith("_")],
     errors="ignore")
 reg_df = pd.DataFrame(all_reg_results).drop(
-    columns=[c for c in pd.DataFrame(all_reg_results).columns if c.startswith("_fold_")],
+    columns=[c for c in pd.DataFrame(all_reg_results).columns if c.startswith("_")],
     errors="ignore")
 clf_df.to_csv(os.path.join(_OUTPUT_DIR, "results_classification_nested_cv.csv"), index=False)
 reg_df.to_csv(os.path.join(_OUTPUT_DIR, "results_regression_nested_cv.csv"), index=False)
@@ -1110,3 +1146,177 @@ if len(reg_df) > 0:
         ).round(3).sort_values("R2_mean", ascending=False)
         print("\nRegression:")
         print(sel_summary.to_string())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROC / PR curves and permutation feature importance (best config per feat set)
+# ═══════════════════════════════════════════════════════════════════════════════
+from sklearn.model_selection import cross_val_predict, train_test_split
+from sklearn.metrics import (
+    roc_curve, auc, precision_recall_curve, average_precision_score,
+)
+from sklearn.inspection import permutation_importance
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+_FIG_DIR = os.path.join(_REPO_ROOT, "outputs/figures")
+os.makedirs(_FIG_DIR, exist_ok=True)
+
+
+def _build_best_pipeline(row):
+    task = row["_task_type"]
+    sel = row["Selection"]
+    model_name = row["Model"]
+    feat_cols = row["_feature_cols_raw"]
+    feat_names = list(feat_cols) + demographic_cols
+    model_defs = get_clf_models() if task == "classification" else get_reg_models()
+    model_instance, model_params = model_defs[model_name]
+    pipe, grid = build_pipeline_and_grid(
+        clone(model_instance), model_params, sel, task,
+        feature_names=feat_names)
+    return pipe, grid
+
+
+def generate_curves_and_importance(all_results, task_type):
+    primary = "AP_mean" if task_type == "classification" else "R2_mean"
+    best = {}
+    for r in all_results:
+        if np.isnan(r.get(primary, np.nan)):
+            continue
+        key = (r["Outcome"], r["Features"])
+        if key not in best or r[primary] > best[key][primary]:
+            best[key] = r
+
+    by_outcome = {}
+    for (outcome, fs), row in best.items():
+        by_outcome.setdefault(outcome, []).append((fs, row))
+
+    importance_rows = []
+    for outcome, items in by_outcome.items():
+        items.sort(key=lambda t: t[0])
+        if task_type == "classification":
+            fig_roc, ax_roc = plt.subplots(figsize=(6, 6))
+            fig_pr, ax_pr = plt.subplots(figsize=(6, 6))
+        else:
+            fig_sc, ax_sc = plt.subplots(figsize=(6, 6))
+            all_y, all_p = [], []
+
+        for fs, row in items:
+            outcome_col = row["_outcome_col"]
+            feat_cols = row["_feature_cols_raw"]
+            X, y, feat_names = prepare_data(df, feat_cols, outcome_col, demographics=True)
+            try:
+                pipe, grid = _build_best_pipeline(row)
+            except Exception as e:
+                print(f"  build failed [{outcome}/{fs}]: {e}")
+                continue
+
+            if task_type == "classification":
+                inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+                outer_cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=42)
+                gs = GridSearchCV(pipe, grid, cv=inner_cv,
+                                  scoring="average_precision",
+                                  refit=True, n_jobs=-1, error_score=np.nan)
+                try:
+                    y_proba = cross_val_predict(
+                        gs, X, y, cv=outer_cv, method="predict_proba", n_jobs=1)[:, 1]
+                    fpr, tpr, _ = roc_curve(y, y_proba)
+                    ax_roc.plot(fpr, tpr, lw=1.5,
+                                label=f"{fs} (AUC={auc(fpr, tpr):.3f})")
+                    prec, rec, _ = precision_recall_curve(y, y_proba)
+                    ax_pr.plot(rec, prec, lw=1.5,
+                               label=f"{fs} (AP={average_precision_score(y, y_proba):.3f})")
+                except Exception as e:
+                    print(f"  curve failed [{outcome}/{fs}]: {e}")
+            else:
+                inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+                outer_cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+                gs = GridSearchCV(pipe, grid, cv=inner_cv, scoring="r2",
+                                  refit=True, n_jobs=-1, error_score=np.nan)
+                try:
+                    y_pred = cross_val_predict(gs, X, y, cv=outer_cv, n_jobs=1)
+                    ax_sc.scatter(y, y_pred, alpha=0.4, s=15, label=fs)
+                    all_y.append(y); all_p.append(y_pred)
+                except Exception as e:
+                    print(f"  scatter failed [{outcome}/{fs}]: {e}")
+
+            # Permutation importance on a 25% holdout (raw feature space)
+            try:
+                if task_type == "classification":
+                    Xtr, Xte, ytr, yte = train_test_split(
+                        X, y, test_size=0.25, random_state=42, stratify=y)
+                    scoring = "average_precision"
+                else:
+                    Xtr, Xte, ytr, yte = train_test_split(
+                        X, y, test_size=0.25, random_state=42)
+                    scoring = "r2"
+                pipe2, grid2 = _build_best_pipeline(row)
+                gs2 = GridSearchCV(pipe2, grid2, cv=3, scoring=scoring,
+                                   refit=True, n_jobs=-1, error_score=np.nan)
+                gs2.fit(Xtr, ytr)
+                pi = permutation_importance(
+                    gs2.best_estimator_, Xte, yte,
+                    n_repeats=10, random_state=42, n_jobs=-1, scoring=scoring)
+                order = np.argsort(pi.importances_mean)[::-1]
+                for idx in order[:30]:
+                    importance_rows.append({
+                        "Outcome": outcome, "Features": fs,
+                        "Selection": row["Selection"], "Model": row["Model"],
+                        "feature": feat_names[idx],
+                        "importance_mean": pi.importances_mean[idx],
+                        "importance_std": pi.importances_std[idx],
+                    })
+            except Exception as e:
+                print(f"  importance failed [{outcome}/{fs}]: {e}")
+
+        safe = outcome.replace(" ", "_").replace("/", "_")
+        if task_type == "classification":
+            ax_roc.plot([0, 1], [0, 1], "k--", alpha=0.4)
+            ax_roc.set_xlabel("False Positive Rate")
+            ax_roc.set_ylabel("True Positive Rate")
+            ax_roc.set_title(f"ROC — {outcome}")
+            ax_roc.legend(fontsize=8, loc="lower right")
+            ax_roc.grid(alpha=0.3)
+            fig_roc.tight_layout()
+            fig_roc.savefig(os.path.join(_FIG_DIR, f"roc_{safe}.png"), dpi=150)
+            plt.close(fig_roc)
+
+            ax_pr.set_xlabel("Recall"); ax_pr.set_ylabel("Precision")
+            ax_pr.set_title(f"Precision-Recall — {outcome}")
+            ax_pr.legend(fontsize=8, loc="upper right")
+            ax_pr.grid(alpha=0.3)
+            fig_pr.tight_layout()
+            fig_pr.savefig(os.path.join(_FIG_DIR, f"pr_{safe}.png"), dpi=150)
+            plt.close(fig_pr)
+        else:
+            if all_y:
+                ymin = min(np.min(a) for a in all_y)
+                ymax = max(np.max(a) for a in all_y)
+                ax_sc.plot([ymin, ymax], [ymin, ymax], "k--", alpha=0.4)
+            ax_sc.set_xlabel("Observed"); ax_sc.set_ylabel("Predicted (OOF)")
+            ax_sc.set_title(f"Predicted vs Observed — {outcome}")
+            ax_sc.legend(fontsize=8); ax_sc.grid(alpha=0.3)
+            fig_sc.tight_layout()
+            fig_sc.savefig(os.path.join(_FIG_DIR, f"scatter_{safe}.png"), dpi=150)
+            plt.close(fig_sc)
+
+    return importance_rows
+
+
+print("\n" + "=" * 70)
+print("CURVES & FEATURE IMPORTANCE  (best config per outcome × feature set)")
+print("=" * 70)
+
+clf_imp = generate_curves_and_importance(all_clf_results, "classification")
+reg_imp = generate_curves_and_importance(all_reg_results, "regression")
+
+if clf_imp:
+    pd.DataFrame(clf_imp).to_csv(
+        os.path.join(_OUTPUT_DIR, "feature_importance_classification.csv"), index=False)
+    print(f"  Saved: outputs/tables/feature_importance_classification.csv")
+if reg_imp:
+    pd.DataFrame(reg_imp).to_csv(
+        os.path.join(_OUTPUT_DIR, "feature_importance_regression.csv"), index=False)
+    print(f"  Saved: outputs/tables/feature_importance_regression.csv")
+print(f"  Figures: outputs/figures/{{roc,pr,scatter}}_<outcome>.png")
