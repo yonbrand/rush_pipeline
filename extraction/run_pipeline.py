@@ -72,15 +72,37 @@ def load_all_models(cfg, device):
     return models
 
 
+STAGE_GAIT = 'gait'
+STAGE_PA = 'pa'
+STAGE_SLEEP = 'sleep'
+ALL_STAGES = (STAGE_GAIT, STAGE_PA, STAGE_SLEEP)
+
+
+def _stage_output_marker(stage: str, subject_id: str, output_dir: Path) -> Path:
+    """Path used to detect that a given stage has already been computed."""
+    if stage == STAGE_GAIT:
+        return output_dir / 'bouts' / f'{subject_id}.csv'
+    if stage == STAGE_PA:
+        return output_dir / 'daily_pa' / f'{subject_id}.csv'
+    if stage == STAGE_SLEEP:
+        return output_dir / 'daily_sleep' / f'{subject_id}.csv'
+    raise ValueError(f"Unknown stage: {stage}")
+
+
 def process_subject(
     file_path,
     models: dict,
     cfg,
     device,
     output_dir: Path,
+    stages: set,
 ) -> bool:
     """
     Full pipeline for a single subject: Stages 1-3 + save CSVs.
+
+    Args:
+        stages: subset of {'gait', 'pa', 'sleep'} controlling which feature
+            families to compute. Preprocessing always runs.
 
     Returns:
         True if processed successfully, False otherwise.
@@ -90,10 +112,9 @@ def process_subject(
         logger.warning(f"Could not parse subject ID from {file_path}")
         return False
 
-    # Check if already processed
-    bout_file = output_dir / 'bouts' / f'{subject_id}.csv'
-    if bout_file.exists():
-        logger.info(f"Skipping {subject_id} (already processed)")
+    # Skip only if every requested stage already has output on disk
+    if all(_stage_output_marker(s, subject_id, output_dir).exists() for s in stages):
+        logger.info(f"Skipping {subject_id} (already processed for stages: {sorted(stages)})")
         return False
 
     logger.info(f"Processing {subject_id}: {Path(file_path).name}")
@@ -121,17 +142,35 @@ def process_subject(
     processed_acc = df_proc[['x', 'y', 'z']].to_numpy()
     df_index = df_proc.index
 
-    # Compute daily PA from full signal
-    enmo_mg = compute_enmo(processed_acc)
-    daily_pa = compute_daily_pa(enmo_mg, target_fs)
-    num_days = daily_pa['num_days']
+    # ENMO is needed by both PA and sleep stages
+    need_enmo = (STAGE_PA in stages) or (STAGE_SLEEP in stages)
+    enmo_mg = compute_enmo(processed_acc) if need_enmo else None
 
-    # Compute sleep (HDCZA) + rest-activity rhythm features
-    sleep = compute_sleep_features(processed_acc, enmo_mg, df_index, target_fs)
+    # ----- PA stage -----
+    daily_pa = None
+    num_days = None
+    if STAGE_PA in stages:
+        daily_pa = compute_daily_pa(enmo_mg, target_fs)
+        num_days = daily_pa['num_days']
+        if num_days == 0:
+            logger.warning(f"{subject_id}: No full days of data")
+            # Only abort the whole subject if PA was the only stage left to gate on
+            if STAGE_GAIT not in stages and STAGE_SLEEP not in stages:
+                return False
 
-    if num_days == 0:
-        logger.warning(f"{subject_id}: No full days of data")
-        return False
+    # ----- Sleep stage -----
+    sleep = None
+    if STAGE_SLEEP in stages:
+        sleep = compute_sleep_features(processed_acc, enmo_mg, df_index, target_fs)
+
+    # If gait isn't requested, save what we have and return.
+    if STAGE_GAIT not in stages:
+        if STAGE_PA in stages and num_days and num_days > 0:
+            _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
+        if STAGE_SLEEP in stages:
+            _save_sleep(sleep, subject_id, output_dir)
+        logger.info(f"{subject_id}: Saved non-gait stages {sorted(stages)}")
+        return True
 
     # ================================================================
     # STAGE 2: Gait Detection + Bout Assembly
@@ -164,9 +203,10 @@ def process_subject(
 
     if not bouts:
         logger.warning(f"{subject_id}: No walking bouts detected")
-        # Still save daily PA and empty bout/window files
-        _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
-        _save_sleep(sleep, subject_id, output_dir)
+        if STAGE_PA in stages and num_days:
+            _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
+        if STAGE_SLEEP in stages:
+            _save_sleep(sleep, subject_id, output_dir)
         _save_empty_bouts(subject_id, output_dir)
         return True
 
@@ -212,8 +252,10 @@ def process_subject(
     # ================================================================
     _save_bout_csv(bout_df, subject_id, output_dir)
     _save_window_csv(window_df, subject_id, output_dir)
-    _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
-    _save_sleep(sleep, subject_id, output_dir)
+    if STAGE_PA in stages and num_days:
+        _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
+    if STAGE_SLEEP in stages:
+        _save_sleep(sleep, subject_id, output_dir)
 
     logger.info(f"{subject_id}: Saved {len(bout_df)} bouts, {len(window_df)} windows")
     return True
@@ -279,16 +321,30 @@ def _save_empty_bouts(subject_id, output_dir):
 # Main entry points
 # ============================================================================
 
-def run_full_pipeline(cfg):
-    """Run the feature extraction pipeline on all subjects."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+def run_full_pipeline(cfg, stages=None):
+    """Run the feature extraction pipeline on all subjects.
+
+    Args:
+        stages: iterable subset of {'gait', 'pa', 'sleep'}. Defaults to all.
+    """
+    stages = set(stages) if stages else set(ALL_STAGES)
+    unknown = stages - set(ALL_STAGES)
+    if unknown:
+        raise ValueError(f"Unknown stage(s): {unknown}. Valid: {ALL_STAGES}")
+    logger.info(f"Stages enabled: {sorted(stages)}")
 
     output_dir = Path(cfg.data.output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load models
-    models = load_all_models(cfg, device)
+    # Only spin up CUDA + load DL models when gait is requested
+    if STAGE_GAIT in stages:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {device}")
+        models = load_all_models(cfg, device)
+    else:
+        device = torch.device("cpu")
+        models = {}
+        logger.info("Gait stage disabled — skipping DL model loading")
 
     # Discover files
     files = list_mat_files(cfg.data.data_path)
@@ -298,13 +354,14 @@ def run_full_pipeline(cfg):
     n_success = 0
     for file_path in tqdm(files, desc="Processing subjects"):
         try:
-            success = process_subject(file_path, models, cfg, device, output_dir)
+            success = process_subject(file_path, models, cfg, device, output_dir, stages)
             if success:
                 n_success += 1
         except Exception as e:
             logger.error(f"Failed on {file_path}: {e}", exc_info=True)
         finally:
-            torch.cuda.empty_cache()
+            if STAGE_GAIT in stages and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     logger.info(f"Feature extraction complete: {n_success}/{len(files)} subjects")
     logger.info(f"Output saved to: {output_dir}")
@@ -318,10 +375,14 @@ def main():
     )
     parser.add_argument('--config', type=str, default=None,
                         help='Path to config YAML (default: config.yaml in package dir)')
+    parser.add_argument('--stages', type=str, default='gait,pa,sleep',
+                        help="Comma-separated subset of {gait,pa,sleep}. "
+                             "Use e.g. 'sleep' or 'pa,sleep' to skip the DL gait models entirely.")
     args = parser.parse_args()
 
+    stages = {s.strip() for s in args.stages.split(',') if s.strip()}
     cfg = load_config(args.config)
-    run_full_pipeline(cfg)
+    run_full_pipeline(cfg, stages=stages)
 
 
 if __name__ == '__main__':
