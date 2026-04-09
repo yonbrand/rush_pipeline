@@ -104,6 +104,13 @@ BOUT_METRICS = [
 # Core aggregation function
 # ============================================================================
 
+NIGHTLY_SLEEP_METRICS = [
+    'sleep_onset_hour', 'wake_time_hour', 'midsleep_hour',
+    'spt_hours', 'tst_hours', 'waso_hours',
+    'sleep_efficiency', 'awakenings', 'frag_index',
+]
+
+
 def aggregate_subject(
     bout_df: pd.DataFrame,
     window_df: pd.DataFrame,
@@ -111,6 +118,8 @@ def aggregate_subject(
     subject_id: str,
     num_days: int,
     include_hist_bins: bool = False,
+    nightly_sleep_df: pd.DataFrame = None,
+    rar: dict = None,
 ) -> dict:
     """
     Compute all summary statistics for one subject.
@@ -168,6 +177,28 @@ def aggregate_subject(
             row.update(_calc_stats(data, f'{key}_', robust=False))
         else:
             row.update(_calc_stats(np.array([]), f'{key}_', robust=False))
+
+    # --- Nightly sleep statistics (HDCZA) ---
+    for metric in NIGHTLY_SLEEP_METRICS:
+        prefix = f'sleep_{metric}_'
+        if nightly_sleep_df is not None and metric in nightly_sleep_df.columns:
+            data = nightly_sleep_df[metric].dropna().values
+            row.update(_calc_stats(data, prefix, robust=False))
+        else:
+            row.update(_calc_stats(np.array([]), prefix, robust=False))
+    row['sleep_n_nights'] = int(len(nightly_sleep_df)) if nightly_sleep_df is not None else 0
+
+    # --- Subject-level rest-activity rhythm metrics ---
+    rar_keys = ['rar_is', 'rar_iv', 'rar_l5', 'rar_m10',
+                'rar_l5_onset_hour', 'rar_ra', 'rar_sri']
+    if rar is None:
+        rar = {}
+    for k in rar_keys:
+        v = rar.get(k, np.nan)
+        try:
+            row[k] = float(v) if v is not None and np.isfinite(v) else np.nan
+        except (TypeError, ValueError):
+            row[k] = np.nan
 
     # --- Bout count ---
     row['n_bouts'] = len(bout_df)
@@ -846,6 +877,8 @@ def _aggregate_single_dir(base_dir: Path, device: str = None,
     bout_dir = base_dir / 'bouts'
     window_dir = base_dir / 'windows'
     daily_pa_dir = base_dir / 'daily_pa'
+    daily_sleep_dir = base_dir / 'daily_sleep'
+    rar_dir = base_dir / 'rar'
 
     bout_files = sorted(bout_dir.glob('*.csv'))
     logger.info(f"{'Device ' + repr(device) + ': ' if device else ''}Found {len(bout_files)} subjects to aggregate")
@@ -872,6 +905,24 @@ def _aggregate_single_dir(base_dir: Path, device: str = None,
                     daily_pa[col] = pa_df[col].values
             num_days = len(pa_df)
 
+        nightly_sleep_df = None
+        nightly_sleep_file = daily_sleep_dir / f'{subject_id}.csv'
+        if nightly_sleep_file.exists():
+            try:
+                nightly_sleep_df = pd.read_csv(nightly_sleep_file)
+            except pd.errors.EmptyDataError:
+                nightly_sleep_df = None
+
+        rar = None
+        rar_file = rar_dir / f'{subject_id}.csv'
+        if rar_file.exists():
+            try:
+                rar_df = pd.read_csv(rar_file)
+                if len(rar_df) > 0:
+                    rar = rar_df.iloc[0].to_dict()
+            except pd.errors.EmptyDataError:
+                rar = None
+
         row = aggregate_subject(
             bout_df=bout_df,
             window_df=window_df,
@@ -879,6 +930,8 @@ def _aggregate_single_dir(base_dir: Path, device: str = None,
             subject_id=subject_id,
             num_days=num_days,
             include_hist_bins=include_hist_bins,
+            nightly_sleep_df=nightly_sleep_df,
+            rar=rar,
         )
         if device is not None:
             row['device'] = device

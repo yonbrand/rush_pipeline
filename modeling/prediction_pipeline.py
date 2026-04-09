@@ -48,7 +48,7 @@ from itertools import combinations
 
 # Resolve paths relative to the repository root (one level up from modeling/)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_OUTPUT_DIR = os.path.join(_REPO_ROOT, "outputs/tables")
+_OUTPUT_DIR = os.path.join(_REPO_ROOT, r"outputs\tables")
 
 warnings.filterwarnings("ignore")
 
@@ -97,7 +97,18 @@ daily_pa_cols = [
     or c.startswith("tdpa_")
 ]
 
-exclude_from_features = set(id_cols + daily_pa_cols + [
+# Sleep feature set: HDCZA nightly summary stats + rest-activity rhythm metrics.
+# See extraction/sleep_features.py for algorithms (van Hees HDCZA + Witting/Van
+# Someren IS/IV/L5/M10/RA + Lunsford-Avery SRI).
+sleep_cols = [
+    c for c in df.columns
+    if c.startswith("sleep_")
+    or c.startswith("rar_")
+]
+# `sleep_n_nights` is a QC count, not a feature
+sleep_cols = [c for c in sleep_cols if c != "sleep_n_nights"]
+
+exclude_from_features = set(id_cols + daily_pa_cols + sleep_cols + ["sleep_n_nights"] + [
     "age_bl", "msex", "educ", "race7", "study", "device", "sub_id",
     "parkinsonism_yn", "dcfdx", "dementia", "cpd_ever", "cogdx",
     "rosbsum", "falls", "falls_binary", "mobility_disability_binary",
@@ -120,6 +131,8 @@ gait_bout_cols = [
     and not c.startswith("daily_pa_mean_")
     and not c.startswith("daily_pa_std_")
     and not c.startswith("tdpa_")
+    and not c.startswith("sleep_")
+    and not c.startswith("rar_")
 ]
 
 # ── Drop prob_bin* features (exact duplicates of freq_bin*) ──────────────────
@@ -136,6 +149,7 @@ demographic_cols = ["age_at_visit", "msex", "educ"]
 
 print(f"Gait bout features: {len(gait_bout_cols)}")
 print(f"Daily PA features:  {len(daily_pa_cols)}")
+print(f"Sleep features:     {len(sleep_cols)}")
 
 # ── Outcome definitions ──────────────────────────────────────────────────────
 BINARY_OUTCOMES = {
@@ -153,6 +167,8 @@ CONTINUOUS_OUTCOMES = {
 FEATURE_SETS = {
     "Gait Bout": gait_bout_cols,
     "Daily PA": daily_pa_cols,
+    "Sleep": sleep_cols,
+    "Daily PA + Sleep": daily_pa_cols + sleep_cols,
     "Combined": gait_bout_cols + daily_pa_cols,
 }
 

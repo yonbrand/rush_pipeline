@@ -39,6 +39,7 @@ from io_utils import (
     list_mat_files, extract_raw_data, parse_subject_id, setup_model,
 )
 from preprocessing import preprocess_subject, compute_enmo, compute_daily_pa
+from sleep_features import compute_sleep_features
 from gait_detection import (
     run_gait_detection, window_predictions_to_seconds,
     merge_bouts, detect_bouts,
@@ -125,6 +126,9 @@ def process_subject(
     daily_pa = compute_daily_pa(enmo_mg, target_fs)
     num_days = daily_pa['num_days']
 
+    # Compute sleep (HDCZA) + rest-activity rhythm features
+    sleep = compute_sleep_features(processed_acc, enmo_mg, df_index, target_fs)
+
     if num_days == 0:
         logger.warning(f"{subject_id}: No full days of data")
         return False
@@ -162,6 +166,7 @@ def process_subject(
         logger.warning(f"{subject_id}: No walking bouts detected")
         # Still save daily PA and empty bout/window files
         _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
+        _save_sleep(sleep, subject_id, output_dir)
         _save_empty_bouts(subject_id, output_dir)
         return True
 
@@ -208,6 +213,7 @@ def process_subject(
     _save_bout_csv(bout_df, subject_id, output_dir)
     _save_window_csv(window_df, subject_id, output_dir)
     _save_daily_pa(daily_pa, num_days, subject_id, output_dir)
+    _save_sleep(sleep, subject_id, output_dir)
 
     logger.info(f"{subject_id}: Saved {len(bout_df)} bouts, {len(window_df)} windows")
     return True
@@ -240,6 +246,26 @@ def _save_daily_pa(daily_pa, num_days, subject_id, output_dir):
             row[key] = float(arr[d]) if d < len(arr) else np.nan
         rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _save_sleep(sleep, subject_id, output_dir):
+    """Save per-night HDCZA metrics and subject-level RAR metrics."""
+    nightly = sleep.get('nightly', []) or []
+    night_path = output_dir / 'daily_sleep' / f'{subject_id}.csv'
+    night_path.parent.mkdir(parents=True, exist_ok=True)
+    if nightly:
+        pd.DataFrame(nightly).to_csv(night_path, index=False)
+    else:
+        pd.DataFrame(columns=[
+            'night', 'sleep_onset_hour', 'wake_time_hour', 'midsleep_hour',
+            'spt_hours', 'tst_hours', 'waso_hours', 'sleep_efficiency',
+            'awakenings', 'frag_index',
+        ]).to_csv(night_path, index=False)
+
+    rar = sleep.get('rar', {}) or {}
+    rar_path = output_dir / 'rar' / f'{subject_id}.csv'
+    rar_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([rar]).to_csv(rar_path, index=False)
 
 
 def _save_empty_bouts(subject_id, output_dir):
