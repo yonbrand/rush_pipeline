@@ -16,7 +16,7 @@ from pathlib import Path
 
 # ── Configure these ──────────────────────────────────────────────────────────
 CONFIG_PATH = "config.yaml"
-SINGLE_FILE = "<path-to-your-mat-file>"  # ← pick one real .mat file
+SINGLE_FILE = r"N:\Projects\RUSH\Data\axivity 2024\Mat files\acc\2020_03_27301_77333587_08_02282020.mat"  # ← pick one real .mat file
 OUTPUT_DIR  = "debug_output"
 # ─────────────────────────────────────────────────────────────────────────────
 

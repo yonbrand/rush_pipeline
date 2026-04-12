@@ -333,7 +333,7 @@ class StabilitySelector(BaseEstimator, TransformerMixin):
 
             if self.task_type == "classification":
                 est = LogisticRegression(
-                    l1_ratio=1.0, solver="saga", C=0.1,
+                    penalty="l1", solver="saga", C=0.1,
                     max_iter=5000, class_weight="balanced", random_state=42)
             else:
                 est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
@@ -598,8 +598,8 @@ def build_pipeline_and_grid(model, model_params, selection_strategy, task_type,
     elif selection_strategy == "L1-based":
         if task_type == "classification":
             l1_est = LogisticRegression(
-                l1_ratio=1.0, solver="saga", C=0.1,
-                max_iter=5000, class_weight="balanced", random_state=42)
+            penalty="l1", solver="saga", C=0.1,
+            max_iter=5000, class_weight="balanced", random_state=42)
         else:
             l1_est = Lasso(alpha=0.1, max_iter=5000, random_state=42)
         steps.append(("select", SelectFromModel(l1_est)))
@@ -1230,7 +1230,7 @@ def generate_curves_and_importance(all_results, task_type):
 
             if task_type == "classification":
                 inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-                outer_cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=42)
+                outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
                 gs = GridSearchCV(pipe, grid, cv=inner_cv,
                                   scoring="average_precision",
                                   refit=True, n_jobs=-1, error_score=np.nan)
@@ -1247,7 +1247,7 @@ def generate_curves_and_importance(all_results, task_type):
                     print(f"  curve failed [{outcome}/{fs}]: {e}")
             else:
                 inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
-                outer_cv = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+                outer_cv = KFold(n_splits=5, shuffle=True, random_state=42)
                 gs = GridSearchCV(pipe, grid, cv=inner_cv, scoring="r2",
                                   refit=True, n_jobs=-1, error_score=np.nan)
                 try:
