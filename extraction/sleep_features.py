@@ -113,8 +113,8 @@ def detect_sib(
     angle_epochs: np.ndarray,
     epoch_sec: int = 5,
     smooth_min: float = 5.0,
-    threshold_deg: float = 0.13,
-    min_dur_min: float = 30.0,
+    threshold_deg: float = 0.5,
+    min_dur_min: float = 15.0,
 ) -> np.ndarray:
     """
     Detect Sustained Inactivity Bouts (SIB) from the per-epoch arm angle.
