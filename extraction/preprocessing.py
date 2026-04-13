@@ -24,6 +24,7 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
                        min_wear_hours: float = 72.0,
                        require_all_hours: bool = True,
                        max_gap_minutes: float = 180.0,
+                       detect_nonwear: bool = True,
                        nonwear_patience: str = '120m',
                        nonwear_stdtol: float = 0.013) -> Optional[pd.DataFrame]:
     """
@@ -40,6 +41,9 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
         max_gap_minutes: Maximum non-wear gap (in minutes) to impute. Gaps longer
             than this are NOT imputed; instead, the longest contiguous valid
             segment is kept and shorter fragments are discarded.
+        detect_nonwear: Whether to run non-wear detection and imputation.
+            If False, skips non-wear flagging, wear-time validation, and
+            imputation — just calibrates and resamples.
         nonwear_patience: Minimum duration for a stationary episode to be classified
             as non-wear (default '120m'). Actipy default is '90m' which is too
             aggressive for elderly subjects with quiet sleep/rest periods.
@@ -64,30 +68,36 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
         info.update(info_calib)
 
         # 2. Non-wear detection with tuned thresholds
-        df_proc, info_nonwear = actipy_P.flag_nonwear(
-            df_proc,
-            patience=nonwear_patience,
-            stdtol=nonwear_stdtol,
-        )
-        info.update(info_nonwear)
-        logger.info(f"Non-wear detection: {info_nonwear.get('NumNonwearEpisodes', 0)} episodes, "
-                    f"{info_nonwear.get('NonwearTime(days)', 0):.2f} days flagged")
+        if detect_nonwear:
+            df_proc, info_nonwear = actipy_P.flag_nonwear(
+                df_proc,
+                patience=nonwear_patience,
+                stdtol=nonwear_stdtol,
+            )
+            info.update(info_nonwear)
+            logger.info(f"Non-wear detection: {info_nonwear.get('NumNonwearEpisodes', 0)} episodes, "
+                        f"{info_nonwear.get('NonwearTime(days)', 0):.2f} days flagged")
+        else:
+            logger.info("Non-wear detection disabled — skipping")
 
         # 3. Resample
         df_proc, info_resample = actipy_P.resample(df_proc, target_fs)
         info.update(info_resample)
 
-        # Validate wear time BEFORE imputation (when we can still see missing data)
-        is_valid, wear_info = validate_wear_time(
-            df_proc, target_fs, min_wear_hours, require_all_hours
-        )
-        if not is_valid:
-            logger.warning(f"Wear time validation failed: {wear_info}")
-            return None
+        if detect_nonwear:
+            # Validate wear time BEFORE imputation (when we can still see missing data)
+            is_valid, wear_info = validate_wear_time(
+                df_proc, target_fs, min_wear_hours, require_all_hours
+            )
+            if not is_valid:
+                logger.warning(f"Wear time validation failed: {wear_info}")
+                return None
 
-        # Impute only small missing gaps; truncate at large non-wear segments
-        df_imputed = _impute_missing(df_proc, target_fs=target_fs,
-                                     max_gap_minutes=max_gap_minutes)
+            # Impute only small missing gaps; truncate at large non-wear segments
+            df_imputed = _impute_missing(df_proc, target_fs=target_fs,
+                                         max_gap_minutes=max_gap_minutes)
+        else:
+            df_imputed = df_proc
 
         # Drop partial first/last days
         if drop_first_last:

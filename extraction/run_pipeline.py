@@ -136,6 +136,7 @@ def process_subject(
         min_wear_hours=cfg.pipeline.get('min_wear_hours', 72.0),
         require_all_hours=cfg.pipeline.get('require_all_hours', True),
         max_gap_minutes=cfg.pipeline.get('max_gap_minutes', 180.0),
+        detect_nonwear=cfg.pipeline.get('detect_nonwear', True),
         nonwear_patience=cfg.pipeline.get('nonwear_patience', '120m'),
         nonwear_stdtol=cfg.pipeline.get('nonwear_stdtol', 0.013),
     )
