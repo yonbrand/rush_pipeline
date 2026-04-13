@@ -135,7 +135,9 @@ def process_subject(
         drop_first_last=cfg.pipeline.get('drop_first_last_days', True),
         min_wear_hours=cfg.pipeline.get('min_wear_hours', 72.0),
         require_all_hours=cfg.pipeline.get('require_all_hours', True),
-        max_gap_minutes=cfg.pipeline.get('max_gap_minutes', 60.0),
+        max_gap_minutes=cfg.pipeline.get('max_gap_minutes', 180.0),
+        nonwear_patience=cfg.pipeline.get('nonwear_patience', '120m'),
+        nonwear_stdtol=cfg.pipeline.get('nonwear_stdtol', 0.013),
     )
     if df_proc is None:
         return False

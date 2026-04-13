@@ -13,7 +13,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from actipy.reader import process as actipy_process
+from actipy import processing as actipy_P
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,9 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
                        drop_first_last: bool = True,
                        min_wear_hours: float = 72.0,
                        require_all_hours: bool = True,
-                       max_gap_minutes: float = 60.0) -> Optional[pd.DataFrame]:
+                       max_gap_minutes: float = 180.0,
+                       nonwear_patience: str = '120m',
+                       nonwear_stdtol: float = 0.013) -> Optional[pd.DataFrame]:
     """
     Full preprocessing pipeline for a single subject.
 
@@ -38,6 +40,11 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
         max_gap_minutes: Maximum non-wear gap (in minutes) to impute. Gaps longer
             than this are NOT imputed; instead, the longest contiguous valid
             segment is kept and shorter fragments are discarded.
+        nonwear_patience: Minimum duration for a stationary episode to be classified
+            as non-wear (default '120m'). Actipy default is '90m' which is too
+            aggressive for elderly subjects with quiet sleep/rest periods.
+        nonwear_stdtol: Std deviation threshold (in g) below which a window is
+            considered stationary (default 0.013). Actipy default is 0.015.
 
     Returns:
         DataFrame with columns ['x', 'y', 'z'] and DatetimeIndex, or None.
@@ -47,15 +54,28 @@ def preprocess_subject(acc: np.ndarray, fs: float, start_time_str: str,
         df_raw = _acc_to_df(acc, fs, start_time_str)
 
         # actipy: calibrate gravity, detect nonwear, resample
-        df_proc, info = actipy_process(
-            df_raw,
-            sample_rate=fs,
-            lowpass_hz=None,
-            calibrate_gravity=True,
-            detect_nonwear=True,
-            resample_hz=target_fs,
-            verbose=False
+        # Call steps separately so we can tune non-wear detection thresholds
+        # (actipy_process only accepts a boolean for detect_nonwear)
+        info = {}
+        df_proc = df_raw
+
+        # 1. Gravity calibration
+        df_proc, info_calib = actipy_P.calibrate_gravity(df_proc)
+        info.update(info_calib)
+
+        # 2. Non-wear detection with tuned thresholds
+        df_proc, info_nonwear = actipy_P.flag_nonwear(
+            df_proc,
+            patience=nonwear_patience,
+            stdtol=nonwear_stdtol,
         )
+        info.update(info_nonwear)
+        logger.info(f"Non-wear detection: {info_nonwear.get('NumNonwearEpisodes', 0)} episodes, "
+                    f"{info_nonwear.get('NonwearTime(days)', 0):.2f} days flagged")
+
+        # 3. Resample
+        df_proc, info_resample = actipy_P.resample(df_proc, target_fs)
+        info.update(info_resample)
 
         # Validate wear time BEFORE imputation (when we can still see missing data)
         is_valid, wear_info = validate_wear_time(
@@ -147,7 +167,7 @@ def _acc_to_df(acc: np.ndarray, fs: float, start_time_str: str) -> pd.DataFrame:
 
 
 def _impute_missing(data: pd.DataFrame, target_fs: int = 30,
-                    max_gap_minutes: float = 60.0) -> pd.DataFrame:
+                    max_gap_minutes: float = 180.0) -> pd.DataFrame:
     """
     Impute only SHORT non-wear gaps using time-of-day averages;
     discard data beyond large non-wear segments.
