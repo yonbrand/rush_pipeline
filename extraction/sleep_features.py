@@ -30,6 +30,54 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # A. HDCZA per-night sleep detection
 # ---------------------------------------------------------------------------
+def detect_nonwear(
+    acc: np.ndarray,
+    fs: int,
+    window_min: float = 60.0,
+    slide_min: float = 15.0,
+    sd_thresh_mg: float = 13.0,
+    range_thresh_mg: float = 50.0,
+) -> np.ndarray:
+    """
+    van Hees non-wear detection on raw acceleration.
+
+    A window is flagged non-wear if, on >= 2 of 3 axes, both the SD and the
+    range (max-min) of raw acceleration fall below the given thresholds.
+    Overlapping windows vote: a sample is non-wear if ANY window covering
+    it flagged it as non-wear (conservative, matches GGIR behaviour).
+
+    Returns a boolean array of length acc.shape[0] where True = non-wear.
+    """
+    n = acc.shape[0]
+    win = int(round(window_min * 60 * fs))
+    slide = int(round(slide_min * 60 * fs))
+    if n < win:
+        return np.zeros(n, dtype=bool)
+
+    sd_thresh_g = sd_thresh_mg / 1000.0
+    range_thresh_g = range_thresh_mg / 1000.0
+
+    nonwear = np.zeros(n, dtype=bool)
+    start = 0
+    while start + win <= n:
+        seg = acc[start:start + win]
+        sds = seg.std(axis=0)
+        rngs = seg.max(axis=0) - seg.min(axis=0)
+        axis_flags = (sds < sd_thresh_g) & (rngs < range_thresh_g)
+        if axis_flags.sum() >= 2:
+            nonwear[start:start + win] = True
+        start += slide
+
+    # Handle the tail: one final window ending at n
+    if start < n:
+        seg = acc[n - win:n]
+        sds = seg.std(axis=0)
+        rngs = seg.max(axis=0) - seg.min(axis=0)
+        axis_flags = (sds < sd_thresh_g) & (rngs < range_thresh_g)
+        if axis_flags.sum() >= 2:
+            nonwear[n - win:n] = True
+
+    return nonwear
 
 def compute_arm_angle(acc: np.ndarray, fs: int, epoch_sec: int = 5) -> np.ndarray:
     """
@@ -55,6 +103,11 @@ def compute_arm_angle(acc: np.ndarray, fs: int, epoch_sec: int = 5) -> np.ndarra
     angle = angle.reshape(n_epochs, samples_per_epoch)
     return np.median(angle, axis=1)
 
+def _rolling_median(a: np.ndarray, w: int) -> np.ndarray:
+    # centered rolling median, edge-padded with the nearest value
+    s = pd.Series(a)
+    return s.rolling(window=w, center=True, min_periods=1).median().to_numpy()
+
 
 def detect_sib(
     angle_epochs: np.ndarray,
@@ -78,11 +131,8 @@ def detect_sib(
         return np.zeros(angle_epochs.shape, dtype=bool)
 
     diff = np.abs(np.diff(angle_epochs, prepend=angle_epochs[0]))
-
     win = max(1, int(round(smooth_min * 60.0 / epoch_sec)))
-    kernel = np.ones(win) / win
-    smoothed = np.convolve(diff, kernel, mode='same')
-
+    smoothed = _rolling_median(diff, win)
     below = smoothed < threshold_deg
 
     min_run = max(1, int(round(min_dur_min * 60.0 / epoch_sec)))
@@ -107,19 +157,24 @@ def detect_spt_windows(
     sib: np.ndarray,
     epoch_index: pd.DatetimeIndex,
     epoch_sec: int = 5,
+    merge_gap_min: float = 60.0,
 ) -> List[Tuple[int, int, pd.Timestamp, pd.Timestamp]]:
     """
-    Collapse SIB epochs into one Sleep Period Time (SPT) window per night,
-    defined as the longest run of SIB epochs (allowing brief wake gaps --
-    standard HDCZA) inside each noon-to-noon window.
+    Collapse SIB epochs into one Sleep Period Time (SPT) window per night.
 
-    Returns a list of (start_epoch_idx, end_epoch_idx, start_ts, end_ts).
-    end is exclusive.
+    Follows HDCZA / GGIR convention: within each noon-to-noon window, SIB
+    runs separated by gaps shorter than `merge_gap_min` minutes are merged
+    into a single block, and the longest merged block becomes the SPT
+    window for that night. Non-SIB epochs inside the chosen block are
+    treated as WASO downstream.
+
+    Returns a list of (start_epoch_idx, end_epoch_idx, start_ts, end_ts),
+    where end_epoch_idx is exclusive.
     """
     if sib.size == 0:
         return []
 
-    # Identify contiguous SIB runs
+    # 1. Identify contiguous SIB runs as (start, end_exclusive) index pairs.
     runs: List[Tuple[int, int]] = []
     i = 0
     n = len(sib)
@@ -136,38 +191,50 @@ def detect_spt_windows(
     if not runs:
         return []
 
-    # Assign each run to the noon-to-noon window containing its midpoint.
-    # Noon-to-noon windowing follows GGIR convention so that a night beginning
-    # at 23:00 and ending at 06:00 is one window, not split across days.
-    starts = epoch_index.values
-    noon_day = pd.to_datetime(starts).normalize() + pd.Timedelta(hours=12)
-    # Convert to day key: date of the most recent noon boundary <= timestamp
-    ts = pd.to_datetime(starts)
+    # 2. Assign each run to a noon-to-noon night based on the timestamp of
+    #    its midpoint. A "night" is keyed by the date of the noon boundary
+    #    that opens it, so e.g. sleep starting 23:00 on 2024-03-10 and ending
+    #    06:00 on 2024-03-11 is keyed to 2024-03-10.
+    ts = pd.to_datetime(epoch_index.values)
     noon_key = np.where(
         ts.hour < 12,
         (ts.normalize() - pd.Timedelta(days=1)),
         ts.normalize(),
     )
 
-    by_night: Dict[pd.Timestamp, Tuple[int, int]] = {}
+    nights: Dict[pd.Timestamp, List[Tuple[int, int]]] = {}
     for (s, e) in runs:
         mid = (s + e) // 2
         if mid >= len(noon_key):
             continue
         key = noon_key[mid]
-        duration = e - s
-        prev = by_night.get(key)
-        if prev is None or (prev[1] - prev[0]) < duration:
-            by_night[key] = (s, e)
+        nights.setdefault(key, []).append((s, e))
 
-    out = []
-    for key in sorted(by_night.keys()):
-        s, e = by_night[key]
+    # 3. Within each night, merge SIB runs separated by <= merge_gap_min,
+    #    then pick the longest merged block as the SPT window.
+    merge_gap_epochs = max(1, int(round(merge_gap_min * 60.0 / epoch_sec)))
+
+    out: List[Tuple[int, int, pd.Timestamp, pd.Timestamp]] = []
+    last_idx = len(epoch_index) - 1
+
+    for key in sorted(nights.keys()):
+        night_runs = sorted(nights[key])
+
+        merged: List[Tuple[int, int]] = [night_runs[0]]
+        for (s, e) in night_runs[1:]:
+            prev_s, prev_e = merged[-1]
+            if s - prev_e <= merge_gap_epochs:
+                merged[-1] = (prev_s, e)
+            else:
+                merged.append((s, e))
+
+        # Longest merged block = SPT for this night
+        s, e = max(merged, key=lambda r: r[1] - r[0])
+
         start_ts = pd.Timestamp(epoch_index[s])
-        # end is exclusive
-        end_idx = min(e, len(epoch_index) - 1)
-        end_ts = pd.Timestamp(epoch_index[end_idx])
+        end_ts = pd.Timestamp(epoch_index[min(e, last_idx)])
         out.append((s, e, start_ts, end_ts))
+
     return out
 
 
@@ -371,6 +438,13 @@ def compute_sleep_features(
     angle = compute_arm_angle(acc, fs=target_fs, epoch_sec=epoch_sec)
     if angle.size > 0:
         sib = detect_sib(angle, epoch_sec=epoch_sec)
+
+        # Mask out non-wear so stationary off-wrist periods aren't counted as sleep
+        nonwear_samples = detect_nonwear(acc, fs=target_fs)
+        samples_per_epoch = int(target_fs * epoch_sec)
+        nw_trimmed = nonwear_samples[: len(angle) * samples_per_epoch]
+        nonwear_epoch = nw_trimmed.reshape(len(angle), samples_per_epoch).any(axis=1)
+        sib = sib & ~nonwear_epoch
 
         # Epoch-level timestamps (start of each epoch)
         samples_per_epoch = int(target_fs * epoch_sec)
