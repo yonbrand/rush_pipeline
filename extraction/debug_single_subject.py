@@ -18,9 +18,9 @@ from pathlib import Path
 
 # ── Configure these ──────────────────────────────────────────────────────────
 CONFIG_PATH = "config.yaml"
-SINGLE_FILE = r"N:\Projects\RUSH\Data\axivity 2024\Mat files\acc\2020_03_27301_77333587_08_02282020.mat"  # ← pick one real .mat file
+SINGLE_FILE = r"C:\Users\yonbr\rush_pipeline\recording\2020_03_23180_50957643_05_02282020.mat"  # ← pick one real .mat file
 OUTPUT_DIR  = "debug_output"
-STAGES      = {'gait', 'pa', 'sleep'}   # ← subset of {'gait', 'pa', 'sleep'}
+STAGES = {'gait', 'pa', 'sleep'}   # ← subset of {'gait', 'pa', 'sleep'}
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.DEBUG,   # DEBUG = maximum verbosity
@@ -81,6 +81,7 @@ def main():
         drop_first_last=cfg.pipeline.get('drop_first_last_days', True),
         min_wear_hours=cfg.pipeline.get('min_wear_hours', 72.0),
         require_all_hours=cfg.pipeline.get('require_all_hours', True),
+        max_gap_minutes=cfg.pipeline.get('max_gap_minutes', 60.0),
     )
     assert df_proc is not None, "Preprocessing returned None"
     logger.info(f"Preprocessed: {len(df_proc)} samples, "

@@ -16,6 +16,7 @@ pipeline:
   filter_static_windows: true  # Use Otsu's method to filter low-variance (static) windows before gait detection.
   min_wear_hours: 72  # Minimum hours of valid wear data (72h = 3 days). Subjects below this are excluded.
   require_all_hours: true  # Require wear data in each one-hour period of the 24-hour cycle.
+  max_gap_minutes: 60  # Maximum non-wear gap (minutes) to impute. Gaps longer than this are NOT imputed; the longest contiguous valid segment is kept.
 
 entropy:
   m: 2
