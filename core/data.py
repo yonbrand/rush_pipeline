@@ -69,21 +69,57 @@ def _classify_columns(df):
     return gait_bout_cols, daily_pa_cols, sleep_cols
 
 
-def feature_sets(df):
+def feature_sets(df, verbose=True):
     """
-    Return the 7 preregistered ladder rungs as {name: [cols]}.
-    Demographics are NOT included here — append at prepare_data time.
+    Return the preregistered ladder rungs as {name: [cols]}.
+
+    Demographics are NOT included here -- append at prepare_data time.
+
+    Rungs whose sensor cols are entirely absent from the CSV are SKIPPED
+    (including the empty-sensor state, which would otherwise duplicate
+    "Demographics only"). The "Full Sensor" rung is named to reflect what
+    is actually included, and is only emitted if at least two sensor
+    blocks are present (otherwise it collapses onto a single-block rung).
     """
     gait, pa, sleep = _classify_columns(df)
-    return {
-        "Demographics only": [],
-        "+ 8ft Gait Speed": ["gait_speed"],
-        "+ Daily PA": pa,
-        "+ Sleep / RAR": sleep,
-        "+ Gait Bout": gait,
-        "Full Sensor (Gait + PA + Sleep)": gait + pa + sleep,
-        "+ Gait Bout + 8ft": gait + ["gait_speed"],
-    }
+    has_gait_speed = "gait_speed" in df.columns
+
+    rungs = {"Demographics only": []}
+
+    if has_gait_speed:
+        rungs["+ 8ft Gait Speed"] = ["gait_speed"]
+    if pa:
+        rungs["+ Daily PA"] = pa
+    if sleep:
+        rungs["+ Sleep / RAR"] = sleep
+    if gait:
+        rungs["+ Gait Bout"] = gait
+
+    # Full-sensor rung — only emit if >=2 sensor blocks exist; otherwise
+    # it duplicates one of the single-block rungs above.
+    sensor_blocks = [b for b in [gait, pa, sleep] if b]
+    if len(sensor_blocks) >= 2:
+        parts = []
+        if gait: parts.append("Gait")
+        if pa:   parts.append("PA")
+        if sleep: parts.append("Sleep")
+        name = "Full Sensor (" + "+".join(parts) + ")"
+        rungs[name] = sum(sensor_blocks, [])
+
+    if gait and has_gait_speed:
+        rungs["+ Gait Bout + 8ft"] = gait + ["gait_speed"]
+
+    if verbose:
+        missing = []
+        if not pa: missing.append("Daily PA")
+        if not sleep: missing.append("Sleep / RAR")
+        if not gait: missing.append("Gait Bout")
+        if not has_gait_speed: missing.append("8ft Gait Speed")
+        if missing:
+            print(f"[feature_sets] WARNING: missing column blocks in CSV: "
+                  f"{missing}. Corresponding rungs skipped.")
+
+    return rungs
 
 
 def load_dev():
