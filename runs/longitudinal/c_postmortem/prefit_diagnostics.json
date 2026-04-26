@@ -1,0 +1,137 @@
+{
+  "preregistration": "runs/longitudinal/c_postmortem/preregistration.md",
+  "frozen_on": "2026-04-23",
+  "n_approved": 187,
+  "n_cohort_d": 187,
+  "n_cohort_8": 146,
+  "forced_covariates": [
+    "age_bl",
+    "msex",
+    "educ",
+    "age_death",
+    "pmi",
+    "time_lastce2dod"
+  ],
+  "covariate_non_null_in_approved": {
+    "age_bl": 187,
+    "msex": 187,
+    "educ": 187,
+    "age_death": 187,
+    "pmi": 187,
+    "time_lastce2dod": 187
+  },
+  "gait_speed_non_null_in_approved": 146,
+  "gait_speed_missing_rate_in_approved": 0.2192513368983957,
+  "gait_bout_feature_count": 440,
+  "outcomes": {
+    "ad_adnc": {
+      "source_col": "ad_adnc",
+      "cutpoint_label": "native 0/1",
+      "domain": "Alzheimer's disease neuropath",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 187,
+          "pos": 120,
+          "neg": 67
+        },
+        "cohort_8": {
+          "n": 146,
+          "pos": 95,
+          "neg": 51
+        }
+      }
+    },
+    "lb_7reg": {
+      "source_col": "lb_7reg",
+      "cutpoint_label": "native 0/1",
+      "domain": "Lewy body (7-region)",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 187,
+          "pos": 40,
+          "neg": 147
+        },
+        "cohort_8": {
+          "n": 146,
+          "pos": 30,
+          "neg": 116
+        }
+      }
+    },
+    "tdp_st4_bin": {
+      "source_col": "tdp_st4",
+      "cutpoint_label": ">=1 vs 0 (any-vs-none)",
+      "domain": "TDP-43 staging",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 187,
+          "pos": 101,
+          "neg": 86
+        },
+        "cohort_8": {
+          "n": 146,
+          "pos": 82,
+          "neg": 64
+        }
+      }
+    },
+    "arteriol_scler_bin": {
+      "source_col": "arteriol_scler",
+      "cutpoint_label": ">=2 vs <2 (moderate-severe, MAP/ROS convention)",
+      "domain": "Vascular - arteriolosclerosis",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 186,
+          "pos": 67,
+          "neg": 119
+        },
+        "cohort_8": {
+          "n": 145,
+          "pos": 51,
+          "neg": 94
+        }
+      }
+    },
+    "cvda_4gp2_bin": {
+      "source_col": "cvda_4gp2",
+      "cutpoint_label": ">=2 vs <2 (moderate-severe CAA, MAP/ROS convention)",
+      "domain": "Vascular - cerebrovascular/amyloid angiopathy",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 187,
+          "pos": 48,
+          "neg": 139
+        },
+        "cohort_8": {
+          "n": 146,
+          "pos": 33,
+          "neg": 113
+        }
+      }
+    },
+    "henl_4gp_bin": {
+      "source_col": "henl_4gp",
+      "cutpoint_label": ">=1 vs 0 (any-vs-none; grade>=2 n=10, too sparse)",
+      "domain": "Lewy body (HENL regions)",
+      "per_cohort": {
+        "cohort_d": {
+          "n": 186,
+          "pos": 48,
+          "neg": 138
+        },
+        "cohort_8": {
+          "n": 145,
+          "pos": 38,
+          "neg": 107
+        }
+      }
+    }
+  },
+  "tripwires": {
+    "fired": [],
+    "passed": [
+      "gait_speed missing rate 21.9% <= 30%",
+      "all outcomes pass n>=100 and minority>=25"
+    ]
+  }
+}

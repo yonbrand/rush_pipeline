@@ -94,6 +94,16 @@ Freeze point: `preregistration.md` (FROZEN 2026-04-23). Any further change to th
 
 ---
 
-## Post-freeze changes (none yet)
+## Post-freeze changes
 
-_None. Any future change lives in this section with its own dated heading._
+### 2026-04-23 — Pre-fit data-integrity corrections (caught in `longitudinal/c_common.py` smoke test, BEFORE any model fit)
+
+Three column-level corrections to the gait-bout feature set. All discovered by the common-module smoke test that enumerates rungs and checks for leakage. No inferential code had run at this point.
+
+1. **`gait_speed` explicitly excluded from the gait-bout feature set.** The preregistration implies this (gait_speed is the +8ft comparator, lives in its own rung), but the classifier in `core/data.py::_classify_columns` does not exclude it by default. Without this fix, `gait_speed` would have appeared in both the `+8ft` rung and the `+Gait Bout` / `+Gait Bout + 8ft` rungs, invalidating the Contrast-2 `+Gait Bout vs +8ft` comparison. Corrected; not a change to the inferential plan, just a textual gap in the preregistration.
+
+2. **Neuropathology columns excluded to prevent circular prediction:** `ci_num2_gct`, `ci_num2_mct` (chronic infarct gross/macroscopic cortical), `hip_scl_mid` (hippocampal sclerosis, midline). These are themselves pathology measurements in the postmortem CSV and would be circular as predictors of pathology outcomes. The preregistration's circularity check explicitly covered `gait_speed` but did not enumerate these three. Excluding them matches the spirit of the check (non-circular predictors only). 440 gait-bout features remain after this filter.
+
+3. **Preregistered feature count "~195" was stale.** The actual gait-bout feature count after excluding the 3 pathology cols in #2 is 440 on the postmortem CSV (442 on the cross-sectional ABL CSV under the same classifier). The "~195" estimate in the preregistration was inherited from an older version of the cross-sectional codebase. Factual correction, not a methodological change — the preregistered pipeline (BlockPCA per GAIT_DOMAIN with `var_kept` ∈ {0.80, 0.90}) collapses these 440 raw features into ~30–50 principal components before any estimator sees them.
+
+**Compute-estimate correction:** the preregistration section "## Compute" computed ~56k fits as `104 candidates × 3 inner × 15 outer × 6 outcomes × 2 cohorts = 56,160`. This undercounts cells. Cohort-D runs 2 rungs (Demographics, +Gait Bout) per outcome = 12 cells; Cohort-8 runs 4 rungs (Dem, +8ft, +Gait Bout, +Gait Bout+8ft) per outcome = 24 cells. Correct total: 36 cells × 15 outer × 3 inner × 104 candidates ≈ 168k fits. No inferential change; just a compute-estimate revision. Expected wall clock: ~10–20 hr serial, ~2–5 hr with `n_jobs=-1` on 6–8 cores.
