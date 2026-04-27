@@ -785,7 +785,11 @@ def concatenate_bouts(output_dir: str, output_file: str = None) -> pd.DataFrame:
         logger.info(f"Device '{device}': found {len(bout_files)} bouts files")
 
         for bout_file in bout_files:
-            df = pd.read_csv(bout_file)
+            try:
+                df = pd.read_csv(bout_file)
+            except pd.errors.EmptyDataError:
+                logger.warning(f"  {bout_file.stem}: empty bouts file, skipping")
+                continue
             if 'subject_id' not in df.columns:
                 df.insert(0, 'subject_id', bout_file.stem)
             if 'device' not in df.columns:
@@ -882,18 +886,27 @@ def _aggregate_single_dir(base_dir: Path, device: str = None,
 
     bout_files = sorted(bout_dir.glob('*.csv'))
     logger.info(f"{'Device ' + repr(device) + ': ' if device else ''}Found {len(bout_files)} subjects to aggregate")
-
     results = []
     for bout_file in bout_files:
         subject_id = bout_file.stem
 
-        bout_df = pd.read_csv(bout_file)
+        try:
+            bout_df = pd.read_csv(bout_file)
+        except pd.errors.EmptyDataError:
+            logger.warning(f"  {subject_id}: empty bouts file, skipping subject")
+            continue
 
         # Apply standard preprocessing (rename + outlier filtering)
         bout_df = _preprocess_bout_df(bout_df, subject_id=subject_id)
 
         window_file = window_dir / f'{subject_id}.csv'
-        window_df = pd.read_csv(window_file) if window_file.exists() else pd.DataFrame()
+        if window_file.exists():
+            try:
+                window_df = pd.read_csv(window_file)
+            except pd.errors.EmptyDataError:
+                window_df = pd.DataFrame()
+        else:
+            window_df = pd.DataFrame()
 
         daily_pa_file = daily_pa_dir / f'{subject_id}.csv'
         daily_pa = {}
